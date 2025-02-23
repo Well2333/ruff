@@ -20,6 +20,10 @@ use super::helpers::is_empty_or_null_string;
 /// A `pytest.raises` context manager should only contain a single simple
 /// statement that raises the expected exception.
 ///
+/// In [preview], this rule allows `pytest.raises` bodies to contain `for`
+/// loops with empty bodies (e.g., `pass` or `...` statements), to test
+/// iterator behavior.
+///
 /// ## Example
 /// ```python
 /// import pytest
@@ -46,6 +50,8 @@ use super::helpers::is_empty_or_null_string;
 ///
 /// ## References
 /// - [`pytest` documentation: `pytest.raises`](https://docs.pytest.org/en/latest/reference/reference.html#pytest-raises)
+///
+/// [preview]: https://docs.astral.sh/ruff/preview/
 #[derive(ViolationMetadata)]
 pub(crate) struct PytestRaisesWithMultipleStatements;
 
@@ -166,11 +172,11 @@ const fn is_non_trivial_with_body(body: &[Stmt]) -> bool {
     }
 }
 
-pub(crate) fn raises_call(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn raises_call(checker: &Checker, call: &ast::ExprCall) {
     if is_pytest_raises(&call.func, checker.semantic()) {
         if checker.enabled(Rule::PytestRaisesWithoutException) {
             if call.arguments.is_empty() {
-                checker.diagnostics.push(Diagnostic::new(
+                checker.report_diagnostic(Diagnostic::new(
                     PytestRaisesWithoutException,
                     call.func.range(),
                 ));
@@ -191,12 +197,7 @@ pub(crate) fn raises_call(checker: &mut Checker, call: &ast::ExprCall) {
     }
 }
 
-pub(crate) fn complex_raises(
-    checker: &mut Checker,
-    stmt: &Stmt,
-    items: &[WithItem],
-    body: &[Stmt],
-) {
+pub(crate) fn complex_raises(checker: &Checker, stmt: &Stmt, items: &[WithItem], body: &[Stmt]) {
     let raises_called = items.iter().any(|item| match &item.context_expr {
         Expr::Call(ast::ExprCall { func, .. }) => is_pytest_raises(func, checker.semantic()),
         _ => false,
@@ -205,10 +206,18 @@ pub(crate) fn complex_raises(
     // Check body for `pytest.raises` context manager
     if raises_called {
         let is_too_complex = if let [stmt] = body {
+            let in_preview = checker.settings.preview.is_enabled();
+
             match stmt {
                 Stmt::With(ast::StmtWith { body, .. }) => is_non_trivial_with_body(body),
-                // Allow function and class definitions to test decorators
+                // Allow function and class definitions to test decorators.
                 Stmt::ClassDef(_) | Stmt::FunctionDef(_) => false,
+                // Allow empty `for` loops to test iterators.
+                Stmt::For(ast::StmtFor { body, .. }) if in_preview => match &body[..] {
+                    [Stmt::Pass(_)] => false,
+                    [Stmt::Expr(ast::StmtExpr { value, .. })] => !value.is_ellipsis_literal_expr(),
+                    _ => true,
+                },
                 stmt => is_compound_statement(stmt),
             }
         } else {
@@ -216,7 +225,7 @@ pub(crate) fn complex_raises(
         };
 
         if is_too_complex {
-            checker.diagnostics.push(Diagnostic::new(
+            checker.report_diagnostic(Diagnostic::new(
                 PytestRaisesWithMultipleStatements,
                 stmt.range(),
             ));
@@ -225,7 +234,7 @@ pub(crate) fn complex_raises(
 }
 
 /// PT011
-fn exception_needs_match(checker: &mut Checker, exception: &Expr) {
+fn exception_needs_match(checker: &Checker, exception: &Expr) {
     if let Some(qualified_name) = checker
         .semantic()
         .resolve_qualified_name(exception)
@@ -246,7 +255,7 @@ fn exception_needs_match(checker: &mut Checker, exception: &Expr) {
                 .then_some(qualified_name)
         })
     {
-        checker.diagnostics.push(Diagnostic::new(
+        checker.report_diagnostic(Diagnostic::new(
             PytestRaisesTooBroad {
                 exception: qualified_name,
             },

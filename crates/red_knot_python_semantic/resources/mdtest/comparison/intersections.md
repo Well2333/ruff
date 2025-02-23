@@ -6,7 +6,11 @@ If we have an intersection type `A & B` and we get a definitive true/false answe
 types, we can infer that the result for the intersection type is also true/false:
 
 ```py
-class Base: ...
+from typing import Literal
+
+class Base:
+    def __gt__(self, other) -> bool:
+        return False
 
 class Child1(Base):
     def __eq__(self, other) -> Literal[True]:
@@ -92,8 +96,7 @@ def _(o: object):
     n = None
 
     if o is not None:
-        reveal_type(o)  # revealed: object & ~None
-
+        reveal_type(o)  # revealed:  ~None
         reveal_type(o is n)  # revealed: Literal[False]
         reveal_type(o is not n)  # revealed: Literal[True]
 ```

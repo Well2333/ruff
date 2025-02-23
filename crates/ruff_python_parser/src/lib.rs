@@ -68,11 +68,14 @@ use std::iter::FusedIterator;
 use std::ops::Deref;
 
 pub use crate::error::{FStringErrorType, LexicalErrorType, ParseError, ParseErrorType};
+pub use crate::parser::ParseOptions;
 pub use crate::token::{Token, TokenKind};
 
 use crate::parser::Parser;
 
-use ruff_python_ast::{Expr, Mod, ModExpression, ModModule, PySourceType, Suite};
+use ruff_python_ast::{
+    Expr, Mod, ModExpression, ModModule, PySourceType, StringFlags, StringLiteral, Suite,
+};
 use ruff_python_trivia::CommentRanges;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
@@ -108,7 +111,7 @@ pub mod typing;
 /// assert!(module.is_ok());
 /// ```
 pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
-    Parser::new(source, Mode::Module)
+    Parser::new(source, ParseOptions::from(Mode::Module))
         .parse()
         .try_into_module()
         .unwrap()
@@ -131,7 +134,7 @@ pub fn parse_module(source: &str) -> Result<Parsed<ModModule>, ParseError> {
 /// assert!(expr.is_ok());
 /// ```
 pub fn parse_expression(source: &str) -> Result<Parsed<ModExpression>, ParseError> {
-    Parser::new(source, Mode::Expression)
+    Parser::new(source, ParseOptions::from(Mode::Expression))
         .parse()
         .try_into_expression()
         .unwrap()
@@ -159,18 +162,81 @@ pub fn parse_expression_range(
     range: TextRange,
 ) -> Result<Parsed<ModExpression>, ParseError> {
     let source = &source[..range.end().to_usize()];
-    Parser::new_starts_at(source, Mode::Expression, range.start())
+    Parser::new_starts_at(source, range.start(), ParseOptions::from(Mode::Expression))
         .parse()
         .try_into_expression()
         .unwrap()
         .into_result()
 }
 
-/// Parse the given Python source code using the specified [`Mode`].
+/// Parses a Python expression as if it is parenthesized.
 ///
-/// This function is the most general function to parse Python code. Based on the [`Mode`] supplied,
-/// it can be used to parse a single expression, a full Python program, an interactive expression
-/// or a Python program containing IPython escape commands.
+/// It behaves similarly to [`parse_expression_range`] but allows what would be valid within parenthesis
+///
+/// # Example
+///
+/// Parsing an expression that would be valid within parenthesis:
+///
+/// ```
+/// use ruff_python_parser::parse_parenthesized_expression_range;
+/// # use ruff_text_size::{TextRange, TextSize};
+///
+/// let parsed = parse_parenthesized_expression_range("'''\n int | str'''", TextRange::new(TextSize::new(3), TextSize::new(14)));
+/// assert!(parsed.is_ok());
+pub fn parse_parenthesized_expression_range(
+    source: &str,
+    range: TextRange,
+) -> Result<Parsed<ModExpression>, ParseError> {
+    let source = &source[..range.end().to_usize()];
+    let parsed = Parser::new_starts_at(
+        source,
+        range.start(),
+        ParseOptions::from(Mode::ParenthesizedExpression),
+    )
+    .parse();
+    parsed.try_into_expression().unwrap().into_result()
+}
+
+/// Parses a Python expression from a string annotation.
+///
+/// # Example
+///
+/// Parsing a string annotation:
+///
+/// ```
+/// use ruff_python_parser::parse_string_annotation;
+/// use ruff_python_ast::{StringLiteral, StringLiteralFlags};
+/// use ruff_text_size::{TextRange, TextSize};
+///
+/// let string = StringLiteral {
+///     value: "'''\n int | str'''".to_string().into_boxed_str(),
+///     flags: StringLiteralFlags::empty(),
+///     range: TextRange::new(TextSize::new(0), TextSize::new(16)),
+/// };
+/// let parsed = parse_string_annotation("'''\n int | str'''", &string);
+/// assert!(!parsed.is_ok());
+/// ```
+pub fn parse_string_annotation(
+    source: &str,
+    string: &StringLiteral,
+) -> Result<Parsed<ModExpression>, ParseError> {
+    let range = string
+        .range()
+        .add_start(string.flags.opener_len())
+        .sub_end(string.flags.closer_len());
+    let source = &source[..range.end().to_usize()];
+    if string.flags.is_triple_quoted() {
+        parse_parenthesized_expression_range(source, range)
+    } else {
+        parse_expression_range(source, range)
+    }
+}
+
+/// Parse the given Python source code using the specified [`ParseOptions`].
+///
+/// This function is the most general function to parse Python code. Based on the [`Mode`] supplied
+/// via the [`ParseOptions`], it can be used to parse a single expression, a full Python program,
+/// an interactive expression or a Python program containing IPython escape commands.
 ///
 /// # Example
 ///
@@ -178,16 +244,16 @@ pub fn parse_expression_range(
 /// parsing:
 ///
 /// ```
-/// use ruff_python_parser::{Mode, parse};
+/// use ruff_python_parser::{parse, Mode, ParseOptions};
 ///
-/// let parsed = parse("1 + 2", Mode::Expression);
+/// let parsed = parse("1 + 2", ParseOptions::from(Mode::Expression));
 /// assert!(parsed.is_ok());
 /// ```
 ///
 /// Alternatively, we can parse a full Python program consisting of multiple lines:
 ///
 /// ```
-/// use ruff_python_parser::{Mode, parse};
+/// use ruff_python_parser::{parse, Mode, ParseOptions};
 ///
 /// let source = r#"
 /// class Greeter:
@@ -195,39 +261,39 @@ pub fn parse_expression_range(
 ///   def greet(self):
 ///    print("Hello, world!")
 /// "#;
-/// let parsed = parse(source, Mode::Module);
+/// let parsed = parse(source, ParseOptions::from(Mode::Module));
 /// assert!(parsed.is_ok());
 /// ```
 ///
 /// Additionally, we can parse a Python program containing IPython escapes:
 ///
 /// ```
-/// use ruff_python_parser::{Mode, parse};
+/// use ruff_python_parser::{parse, Mode, ParseOptions};
 ///
 /// let source = r#"
 /// %timeit 1 + 2
 /// ?str.replace
 /// !ls
 /// "#;
-/// let parsed = parse(source, Mode::Ipython);
+/// let parsed = parse(source, ParseOptions::from(Mode::Ipython));
 /// assert!(parsed.is_ok());
 /// ```
-pub fn parse(source: &str, mode: Mode) -> Result<Parsed<Mod>, ParseError> {
-    parse_unchecked(source, mode).into_result()
+pub fn parse(source: &str, options: ParseOptions) -> Result<Parsed<Mod>, ParseError> {
+    parse_unchecked(source, options).into_result()
 }
 
-/// Parse the given Python source code using the specified [`Mode`].
+/// Parse the given Python source code using the specified [`ParseOptions`].
 ///
 /// This is same as the [`parse`] function except that it doesn't check for any [`ParseError`]
 /// and returns the [`Parsed`] as is.
-pub fn parse_unchecked(source: &str, mode: Mode) -> Parsed<Mod> {
-    Parser::new(source, mode).parse()
+pub fn parse_unchecked(source: &str, options: ParseOptions) -> Parsed<Mod> {
+    Parser::new(source, options).parse()
 }
 
 /// Parse the given Python source code using the specified [`PySourceType`].
 pub fn parse_unchecked_source(source: &str, source_type: PySourceType) -> Parsed<ModModule> {
     // SAFETY: Safe because `PySourceType` always parses to a `ModModule`
-    Parser::new(source, source_type.as_mode())
+    Parser::new(source, ParseOptions::from(source_type))
         .parse()
         .try_into_module()
         .unwrap()
@@ -581,6 +647,11 @@ pub enum Mode {
 
     /// The code consists of a single expression.
     Expression,
+
+    /// The code consists of a single expression and is parsed as if it is parenthesized. The parentheses themselves aren't required.
+    /// This allows for having valid multiline expression without the need of parentheses
+    /// and is specifically useful for parsing string annotations.
+    ParenthesizedExpression,
 
     /// The code consists of a sequence of statements which can include the
     /// escape commands that are part of IPython syntax.

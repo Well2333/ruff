@@ -1,10 +1,10 @@
-use super::{definition_expression_ty, Type};
+use super::{definition_expression_type, Type};
 use crate::Db;
 use crate::{semantic_index::definition::Definition, types::todo_type};
 use ruff_python_ast::{self as ast, name::Name};
 
 /// A typed callable signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub(crate) struct Signature<'db> {
     /// Parameters, in source order.
     ///
@@ -21,6 +21,13 @@ pub(crate) struct Signature<'db> {
 }
 
 impl<'db> Signature<'db> {
+    pub(crate) fn new(parameters: Parameters<'db>, return_ty: Option<Type<'db>>) -> Self {
+        Self {
+            parameters,
+            return_ty,
+        }
+    }
+
     /// Return a todo signature: (*args: Todo, **kwargs: Todo) -> Todo
     pub(crate) fn todo() -> Self {
         Self {
@@ -39,7 +46,7 @@ impl<'db> Signature<'db> {
             if function_node.is_async {
                 todo_type!("generic types.CoroutineType")
             } else {
-                definition_expression_ty(db, definition, returns.as_ref())
+                definition_expression_type(db, definition, returns.as_ref())
             }
         });
 
@@ -60,10 +67,14 @@ impl<'db> Signature<'db> {
 }
 
 // TODO: use SmallVec here once invariance bug is fixed
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub(crate) struct Parameters<'db>(Vec<Parameter<'db>>);
 
 impl<'db> Parameters<'db> {
+    pub(crate) fn new(parameters: impl IntoIterator<Item = Parameter<'db>>) -> Self {
+        Self(parameters.into_iter().collect())
+    }
+
     /// Return todo parameters: (*args: Todo, **kwargs: Todo)
     fn todo() -> Self {
         Self(vec![
@@ -93,11 +104,10 @@ impl<'db> Parameters<'db> {
             kwarg,
             range: _,
         } = parameters;
-        let default_ty = |parameter_with_default: &ast::ParameterWithDefault| {
-            parameter_with_default
-                .default
-                .as_deref()
-                .map(|default| definition_expression_ty(db, definition, default))
+        let default_ty = |param: &ast::ParameterWithDefault| {
+            param
+                .default()
+                .map(|default| definition_expression_type(db, definition, default))
         };
         let positional_only = posonlyargs.iter().map(|arg| {
             Parameter::from_node_and_kind(
@@ -219,7 +229,7 @@ impl<'db> std::ops::Index<usize> for Parameters<'db> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub(crate) struct Parameter<'db> {
     /// Parameter name.
     ///
@@ -234,6 +244,18 @@ pub(crate) struct Parameter<'db> {
 }
 
 impl<'db> Parameter<'db> {
+    pub(crate) fn new(
+        name: Option<Name>,
+        annotated_ty: Option<Type<'db>>,
+        kind: ParameterKind<'db>,
+    ) -> Self {
+        Self {
+            name,
+            annotated_ty,
+            kind,
+        }
+    }
+
     fn from_node_and_kind(
         db: &'db dyn Db,
         definition: Definition<'db>,
@@ -243,9 +265,8 @@ impl<'db> Parameter<'db> {
         Self {
             name: Some(parameter.name.id.clone()),
             annotated_ty: parameter
-                .annotation
-                .as_deref()
-                .map(|annotation| definition_expression_ty(db, definition, annotation)),
+                .annotation()
+                .map(|annotation| definition_expression_type(db, definition, annotation)),
             kind,
         }
     }
@@ -276,7 +297,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Annotated type of the parameter, if annotated.
-    pub(crate) fn annotated_ty(&self) -> Option<Type<'db>> {
+    pub(crate) fn annotated_type(&self) -> Option<Type<'db>> {
         self.annotated_ty
     }
 
@@ -295,7 +316,7 @@ impl<'db> Parameter<'db> {
     }
 
     /// Default-value type of the parameter, if any.
-    pub(crate) fn default_ty(&self) -> Option<Type<'db>> {
+    pub(crate) fn default_type(&self) -> Option<Type<'db>> {
         match self.kind {
             ParameterKind::PositionalOnly { default_ty } => default_ty,
             ParameterKind::PositionalOrKeyword { default_ty } => default_ty,
@@ -306,7 +327,7 @@ impl<'db> Parameter<'db> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub(crate) enum ParameterKind<'db> {
     /// Positional-only parameter, e.g. `def f(x, /): ...`
     PositionalOnly { default_ty: Option<Type<'db>> },
@@ -324,7 +345,8 @@ pub(crate) enum ParameterKind<'db> {
 mod tests {
     use super::*;
     use crate::db::tests::{setup_db, TestDb};
-    use crate::types::{global_symbol, FunctionType, KnownClass};
+    use crate::symbol::global_symbol;
+    use crate::types::{FunctionType, KnownClass};
     use ruff_db::system::DbWithTestSystem;
 
     #[track_caller]
@@ -359,6 +381,8 @@ mod tests {
         db.write_dedented(
             "/src/a.py",
             "
+            from typing import Literal
+
             def f(a, b: int, c = 1, d: int = 2, /,
                   e = 3, f: Literal[4] = 4, *args: object,
                   g = 5, h: Literal[6] = 6, **kwargs: str) -> bytes: ...
@@ -413,7 +437,7 @@ mod tests {
                 },
                 Parameter {
                     name: Some(Name::new_static("args")),
-                    annotated_ty: Some(KnownClass::Object.to_instance(&db)),
+                    annotated_ty: Some(Type::object(&db)),
                     kind: ParameterKind::Variadic,
                 },
                 Parameter {
@@ -543,7 +567,10 @@ mod tests {
         assert_eq!(a_name, "a");
         assert_eq!(b_name, "b");
         // TODO resolution should not be deferred; we should see A not B
-        assert_eq!(a_annotated_ty.unwrap().display(&db).to_string(), "B");
+        assert_eq!(
+            a_annotated_ty.unwrap().display(&db).to_string(),
+            "Unknown | B"
+        );
         assert_eq!(b_annotated_ty.unwrap().display(&db).to_string(), "T");
     }
 
@@ -583,7 +610,10 @@ mod tests {
         assert_eq!(a_name, "a");
         assert_eq!(b_name, "b");
         // Parameter resolution deferred; we should see B
-        assert_eq!(a_annotated_ty.unwrap().display(&db).to_string(), "B");
+        assert_eq!(
+            a_annotated_ty.unwrap().display(&db).to_string(),
+            "Unknown | B"
+        );
         assert_eq!(b_annotated_ty.unwrap().display(&db).to_string(), "T");
     }
 

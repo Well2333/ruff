@@ -1,18 +1,18 @@
 use crate::config::Log;
+use crate::parser::{BacktickOffsets, EmbeddedFileSourceMap};
 use camino::Utf8Path;
 use colored::Colorize;
 use parser as test_parser;
 use red_knot_python_semantic::types::check_types;
-use red_knot_python_semantic::Program;
-use ruff_db::diagnostic::{Diagnostic, ParseDiagnostic};
+use red_knot_python_semantic::{Program, ProgramSettings, SearchPathSettings, SitePackages};
+use ruff_db::diagnostic::{Diagnostic, DisplayDiagnosticConfig, ParseDiagnostic};
 use ruff_db::files::{system_path_to_file, File, Files};
 use ruff_db::panic::catch_unwind;
 use ruff_db::parsed::parsed_module;
 use ruff_db::system::{DbWithTestSystem, SystemPathBuf};
 use ruff_db::testing::{setup_logging, setup_logging_with_filter};
 use ruff_source_file::{LineIndex, OneIndexed};
-use ruff_text_size::TextSize;
-use salsa::Setter;
+use std::fmt::Write;
 
 mod assertion;
 mod config;
@@ -27,12 +27,18 @@ const MDTEST_TEST_FILTER: &str = "MDTEST_TEST_FILTER";
 ///
 /// Panic on test failure, and print failure details.
 #[allow(clippy::print_stdout)]
-pub fn run(path: &Utf8Path, long_title: &str, short_title: &str, test_name: &str) {
-    let source = std::fs::read_to_string(path).unwrap();
+pub fn run(
+    absolute_fixture_path: &Utf8Path,
+    relative_fixture_path: &Utf8Path,
+    snapshot_path: &Utf8Path,
+    short_title: &str,
+    test_name: &str,
+) {
+    let source = std::fs::read_to_string(absolute_fixture_path).unwrap();
     let suite = match test_parser::parse(short_title, &source) {
         Ok(suite) => suite,
         Err(err) => {
-            panic!("Error parsing `{path}`: {err:?}")
+            panic!("Error parsing `{absolute_fixture_path}`: {err:?}")
         }
     };
 
@@ -50,31 +56,27 @@ pub fn run(path: &Utf8Path, long_title: &str, short_title: &str, test_name: &str
             Log::Filter(filter) => setup_logging_with_filter(filter),
         });
 
-        Program::get(&db)
-            .set_python_version(&mut db)
-            .to(test.configuration().python_version().unwrap_or_default());
-        Program::get(&db)
-            .set_python_platform(&mut db)
-            .to(test.configuration().python_platform().unwrap_or_default());
-
         // Remove all files so that the db is in a "fresh" state.
         db.memory_file_system().remove_all();
         Files::sync_all(&mut db);
 
-        if let Err(failures) = run_test(&mut db, &test) {
+        if let Err(failures) = run_test(&mut db, relative_fixture_path, snapshot_path, &test) {
             any_failures = true;
             println!("\n{}\n", test.name().bold().underline());
 
             let md_index = LineIndex::from_source_text(&source);
 
             for test_failures in failures {
-                let backtick_line = md_index.line_index(test_failures.backtick_offset);
+                let source_map =
+                    EmbeddedFileSourceMap::new(&md_index, test_failures.backtick_offsets);
 
                 for (relative_line_number, failures) in test_failures.by_line.iter() {
+                    let absolute_line_number =
+                        source_map.to_absolute_line_number(relative_line_number);
+
                     for failure in failures {
-                        let absolute_line_number =
-                            backtick_line.checked_add(relative_line_number).unwrap();
-                        let line_info = format!("{long_title}:{absolute_line_number}").cyan();
+                        let line_info =
+                            format!("{relative_fixture_path}:{absolute_line_number}").cyan();
                         println!("  {line_info} {failure}");
                     }
                 }
@@ -96,8 +98,17 @@ pub fn run(path: &Utf8Path, long_title: &str, short_title: &str, test_name: &str
     assert!(!any_failures, "Some tests failed.");
 }
 
-fn run_test(db: &mut db::Db, test: &parser::MarkdownTest) -> Result<(), Failures> {
-    let workspace_root = db.workspace_root().to_path_buf();
+fn run_test(
+    db: &mut db::Db,
+    relative_fixture_path: &Utf8Path,
+    snapshot_path: &Utf8Path,
+    test: &parser::MarkdownTest,
+) -> Result<(), Failures> {
+    let project_root = db.project_root().to_path_buf();
+    let src_path = SystemPathBuf::from("/src");
+    let custom_typeshed_path = test.configuration().typeshed().map(SystemPathBuf::from);
+    let mut typeshed_files = vec![];
+    let mut has_custom_versions_file = false;
 
     let test_files: Vec<_> = test
         .files()
@@ -107,19 +118,77 @@ fn run_test(db: &mut db::Db, test: &parser::MarkdownTest) -> Result<(), Failures
             }
 
             assert!(
-                matches!(embedded.lang, "py" | "pyi"),
-                "Non-Python files not supported yet."
+                matches!(embedded.lang, "py" | "pyi" | "text"),
+                "Supported file types are: py, pyi, text"
             );
-            let full_path = workspace_root.join(embedded.path);
-            db.write_file(&full_path, embedded.code).unwrap();
+
+            let full_path = embedded.full_path(&project_root);
+
+            if let Some(ref typeshed_path) = custom_typeshed_path {
+                if let Ok(relative_path) = full_path.strip_prefix(typeshed_path.join("stdlib")) {
+                    if relative_path.as_str() == "VERSIONS" {
+                        has_custom_versions_file = true;
+                    } else if relative_path.extension().is_some_and(|ext| ext == "pyi") {
+                        typeshed_files.push(relative_path.to_path_buf());
+                    }
+                }
+            }
+
+            db.write_file(&full_path, &embedded.code).unwrap();
+
+            if !full_path.starts_with(&src_path) || embedded.lang == "text" {
+                // These files need to be written to the file system (above), but we don't run any checks on them.
+                return None;
+            }
+
             let file = system_path_to_file(db, full_path).unwrap();
 
             Some(TestFile {
                 file,
-                backtick_offset: embedded.md_offset,
+                backtick_offsets: embedded.backtick_offsets.clone(),
             })
         })
         .collect();
+
+    // Create a custom typeshed `VERSIONS` file if none was provided.
+    if let Some(ref typeshed_path) = custom_typeshed_path {
+        if !has_custom_versions_file {
+            let versions_file = typeshed_path.join("stdlib/VERSIONS");
+            let contents = typeshed_files
+                .iter()
+                .fold(String::new(), |mut content, path| {
+                    // This is intentionally kept simple:
+                    let module_name = path
+                        .as_str()
+                        .trim_end_matches(".pyi")
+                        .trim_end_matches("/__init__")
+                        .replace('/', ".");
+                    let _ = writeln!(content, "{module_name}: 3.8-");
+                    content
+                });
+            db.write_file(&versions_file, contents).unwrap();
+        }
+    }
+
+    Program::get(db)
+        .update_from_settings(
+            db,
+            ProgramSettings {
+                python_version: test.configuration().python_version().unwrap_or_default(),
+                python_platform: test.configuration().python_platform().unwrap_or_default(),
+                search_paths: SearchPathSettings {
+                    src_roots: vec![src_path],
+                    extra_paths: vec![],
+                    custom_typeshed: custom_typeshed_path,
+                    site_packages: SitePackages::Known(vec![]),
+                },
+            },
+        )
+        .expect("Failed to update Program settings in TestDb");
+
+    // When snapshot testing is enabled, this is populated with
+    // all diagnostics. Otherwise it remains empty.
+    let mut snapshot_diagnostics = vec![];
 
     let failures: Failures = test_files
         .into_iter()
@@ -159,7 +228,7 @@ fn run_test(db: &mut db::Db, test: &parser::MarkdownTest) -> Result<(), Failures
                     }
                     by_line.push(OneIndexed::from_zero_indexed(0), messages);
                     return Some(FileFailures {
-                        backtick_offset: test_file.backtick_offset,
+                        backtick_offsets: test_file.backtick_offsets,
                         by_line,
                     });
                 }
@@ -169,15 +238,40 @@ fn run_test(db: &mut db::Db, test: &parser::MarkdownTest) -> Result<(), Failures
                 diagnostic
             }));
 
-            match matcher::match_file(db, test_file.file, diagnostics) {
-                Ok(()) => None,
-                Err(line_failures) => Some(FileFailures {
-                    backtick_offset: test_file.backtick_offset,
-                    by_line: line_failures,
-                }),
+            let failure =
+                match matcher::match_file(db, test_file.file, diagnostics.iter().map(|d| &**d)) {
+                    Ok(()) => None,
+                    Err(line_failures) => Some(FileFailures {
+                        backtick_offsets: test_file.backtick_offsets,
+                        by_line: line_failures,
+                    }),
+                };
+            if test.should_snapshot_diagnostics() {
+                snapshot_diagnostics.extend(diagnostics);
             }
+            failure
         })
         .collect();
+
+    if snapshot_diagnostics.is_empty() && test.should_snapshot_diagnostics() {
+        panic!(
+            "Test `{}` requested snapshotting diagnostics but it didn't produce any.",
+            test.name()
+        );
+    } else if !snapshot_diagnostics.is_empty() {
+        let snapshot =
+            create_diagnostic_snapshot(db, relative_fixture_path, test, snapshot_diagnostics);
+        let name = test.name().replace(' ', "_").replace(':', "__");
+        insta::with_settings!(
+            {
+                snapshot_path => snapshot_path,
+                input_file => name.clone(),
+                filters => vec![(r"\\", "/")],
+                prepend_module_to_snapshot => false,
+            },
+            { insta::assert_snapshot!(name, snapshot) }
+        );
+    }
 
     if failures.is_empty() {
         Ok(())
@@ -190,9 +284,10 @@ type Failures = Vec<FileFailures>;
 
 /// The failures for a single file in a test by line number.
 struct FileFailures {
-    /// The offset of the backticks that starts the code block in the Markdown file
-    backtick_offset: TextSize,
-    /// The failures by lines in the code block.
+    /// Positional information about the code block(s) to reconstruct absolute line numbers.
+    backtick_offsets: Vec<BacktickOffsets>,
+
+    /// The failures by lines in the file.
     by_line: matcher::FailuresByLine,
 }
 
@@ -200,6 +295,56 @@ struct FileFailures {
 struct TestFile {
     file: File,
 
-    // Offset of the backticks that starts the code block in the Markdown file
-    backtick_offset: TextSize,
+    /// Positional information about the code block(s) to reconstruct absolute line numbers.
+    backtick_offsets: Vec<BacktickOffsets>,
+}
+
+fn create_diagnostic_snapshot<D: Diagnostic>(
+    db: &mut db::Db,
+    relative_fixture_path: &Utf8Path,
+    test: &parser::MarkdownTest,
+    diagnostics: impl IntoIterator<Item = D>,
+) -> String {
+    let display_config = DisplayDiagnosticConfig::default().color(false);
+
+    let mut snapshot = String::new();
+    writeln!(snapshot).unwrap();
+    writeln!(snapshot, "---").unwrap();
+    writeln!(snapshot, "mdtest name: {}", test.name()).unwrap();
+    writeln!(snapshot, "mdtest path: {relative_fixture_path}").unwrap();
+    writeln!(snapshot, "---").unwrap();
+    writeln!(snapshot).unwrap();
+
+    writeln!(snapshot, "# Python source files").unwrap();
+    writeln!(snapshot).unwrap();
+    for file in test.files() {
+        writeln!(snapshot, "## {}", file.relative_path()).unwrap();
+        writeln!(snapshot).unwrap();
+        // Note that we don't use ```py here because the line numbering
+        // we add makes it invalid Python. This sacrifices syntax
+        // highlighting when you look at the snapshot on GitHub,
+        // but the line numbers are extremely useful for analyzing
+        // snapshots. So we keep them.
+        writeln!(snapshot, "```").unwrap();
+
+        let line_number_width = file.code.lines().count().to_string().len();
+        for (i, line) in file.code.lines().enumerate() {
+            let line_number = i + 1;
+            writeln!(snapshot, "{line_number:>line_number_width$} | {line}").unwrap();
+        }
+        writeln!(snapshot, "```").unwrap();
+        writeln!(snapshot).unwrap();
+    }
+
+    writeln!(snapshot, "# Diagnostics").unwrap();
+    writeln!(snapshot).unwrap();
+    for (i, diag) in diagnostics.into_iter().enumerate() {
+        if i > 0 {
+            writeln!(snapshot).unwrap();
+        }
+        writeln!(snapshot, "```").unwrap();
+        writeln!(snapshot, "{}", diag.display(db, &display_config)).unwrap();
+        writeln!(snapshot, "```").unwrap();
+    }
+    snapshot
 }

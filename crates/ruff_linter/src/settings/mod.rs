@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 
 use crate::codes::RuleCodePrefix;
 use ruff_macros::CacheKey;
+use ruff_python_ast::PythonVersion;
 
 use crate::line_width::LineLength;
 use crate::registry::{Linter, Rule};
@@ -19,11 +20,9 @@ use crate::rules::{
     flake8_comprehensions, flake8_copyright, flake8_errmsg, flake8_gettext,
     flake8_implicit_str_concat, flake8_import_conventions, flake8_pytest_style, flake8_quotes,
     flake8_self, flake8_tidy_imports, flake8_type_checking, flake8_unused_arguments, isort, mccabe,
-    pep8_naming, pycodestyle, pydocstyle, pyflakes, pylint, pyupgrade, ruff,
+    pep8_naming, pycodestyle, pydoclint, pydocstyle, pyflakes, pylint, pyupgrade, ruff,
 };
-use crate::settings::types::{
-    CompiledPerFileIgnoreList, ExtensionMapping, FilePatternSet, PythonVersion,
-};
+use crate::settings::types::{CompiledPerFileIgnoreList, ExtensionMapping, FilePatternSet};
 use crate::{codes, RuleSelector};
 
 use super::line_width::IndentWidth;
@@ -260,6 +259,7 @@ pub struct LinterSettings {
     pub mccabe: mccabe::settings::Settings,
     pub pep8_naming: pep8_naming::settings::Settings,
     pub pycodestyle: pycodestyle::settings::Settings,
+    pub pydoclint: pydoclint::settings::Settings,
     pub pydocstyle: pydocstyle::settings::Settings,
     pub pyflakes: pyflakes::settings::Settings,
     pub pylint: pylint::settings::Settings,
@@ -281,7 +281,7 @@ impl Display for LinterSettings {
                 self.per_file_ignores,
                 self.fix_safety | nested,
 
-                self.target_version | debug,
+                self.target_version,
                 self.preview,
                 self.explicit_preview_rules,
                 self.extension | debug,
@@ -425,6 +425,7 @@ impl LinterSettings {
             mccabe: mccabe::settings::Settings::default(),
             pep8_naming: pep8_naming::settings::Settings::default(),
             pycodestyle: pycodestyle::settings::Settings::default(),
+            pydoclint: pydoclint::settings::Settings::default(),
             pydocstyle: pydocstyle::settings::Settings::default(),
             pyflakes: pyflakes::settings::Settings::default(),
             pylint: pylint::settings::Settings::default(),

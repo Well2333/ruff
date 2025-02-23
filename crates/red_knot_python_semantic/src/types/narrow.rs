@@ -6,6 +6,7 @@ use crate::semantic_index::definition::Definition;
 use crate::semantic_index::expression::Expression;
 use crate::semantic_index::symbol::{ScopeId, ScopedSymbolId, SymbolTable};
 use crate::semantic_index::symbol_table;
+use crate::types::infer::infer_same_file_expression_type;
 use crate::types::{
     infer_expression_types, ClassLiteralType, IntersectionBuilder, KnownClass, KnownFunction,
     SubclassOfType, Truthiness, Type, UnionBuilder,
@@ -152,13 +153,13 @@ fn merge_constraints_or<'db>(
                 *entry.get_mut() = UnionBuilder::new(db).add(*entry.get()).add(*value).build();
             }
             Entry::Vacant(entry) => {
-                entry.insert(KnownClass::Object.to_instance(db));
+                entry.insert(Type::object(db));
             }
         }
     }
     for (key, value) in into.iter_mut() {
         if !from.contains_key(key) {
-            *value = KnownClass::Object.to_instance(db);
+            *value = Type::object(db);
         }
     }
 }
@@ -231,10 +232,10 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
 
         match pattern.kind(self.db) {
             PatternConstraintKind::Singleton(singleton, _guard) => {
-                self.evaluate_match_pattern_singleton(*subject, *singleton)
+                self.evaluate_match_pattern_singleton(subject, *singleton)
             }
             PatternConstraintKind::Class(cls, _guard) => {
-                self.evaluate_match_pattern_class(*subject, *cls)
+                self.evaluate_match_pattern_class(subject, *cls)
             }
             // TODO: support more pattern kinds
             PatternConstraintKind::Value(..) | PatternConstraintKind::Unsupported => None,
@@ -322,9 +323,9 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
 
         for (op, (left, right)) in std::iter::zip(&**ops, comparator_tuples) {
             let lhs_ty = last_rhs_ty.unwrap_or_else(|| {
-                inference.expression_ty(left.scoped_expression_id(self.db, scope))
+                inference.expression_type(left.scoped_expression_id(self.db, scope))
             });
-            let rhs_ty = inference.expression_ty(right.scoped_expression_id(self.db, scope));
+            let rhs_ty = inference.expression_type(right.scoped_expression_id(self.db, scope));
             last_rhs_ty = Some(rhs_ty);
 
             match left {
@@ -393,7 +394,7 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
                     }
 
                     let callable_ty =
-                        inference.expression_ty(callable.scoped_expression_id(self.db, scope));
+                        inference.expression_type(callable.scoped_expression_id(self.db, scope));
 
                     if callable_ty
                         .into_class_literal()
@@ -422,7 +423,7 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
         let inference = infer_expression_types(self.db, expression);
 
         let callable_ty =
-            inference.expression_ty(expr_call.func.scoped_expression_id(self.db, scope));
+            inference.expression_type(expr_call.func.scoped_expression_id(self.db, scope));
 
         // TODO: add support for PEP 604 union types on the right hand side of `isinstance`
         // and `issubclass`, for example `isinstance(x, str | (int | float))`.
@@ -441,7 +442,7 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
                 let symbol = self.symbols().symbol_id_by_name(id).unwrap();
 
                 let class_info_ty =
-                    inference.expression_ty(class_info.scoped_expression_id(self.db, scope));
+                    inference.expression_type(class_info.scoped_expression_id(self.db, scope));
 
                 function
                     .generate_constraint(self.db, class_info_ty)
@@ -497,11 +498,8 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
         if let Some(ast::ExprName { id, .. }) = subject.node_ref(self.db).as_name_expr() {
             // SAFETY: we should always have a symbol for every Name node.
             let symbol = self.symbols().symbol_id_by_name(id).unwrap();
-            let scope = self.scope();
-            let inference = infer_expression_types(self.db, cls);
-            let ty = inference
-                .expression_ty(cls.node_ref(self.db).scoped_expression_id(self.db, scope))
-                .to_instance(self.db);
+            let ty = infer_same_file_expression_type(self.db, cls).to_instance(self.db);
+
             let mut constraints = NarrowingConstraints::default();
             constraints.insert(symbol, ty);
             Some(constraints)
@@ -524,7 +522,7 @@ impl<'db> NarrowingConstraintsBuilder<'db> {
             // filter our arms with statically known truthiness
             .filter(|expr| {
                 inference
-                    .expression_ty(expr.scoped_expression_id(self.db, scope))
+                    .expression_type(expr.scoped_expression_id(self.db, scope))
                     .bool(self.db)
                     != match expr_bool_op.op {
                         BoolOp::And => Truthiness::AlwaysTrue,

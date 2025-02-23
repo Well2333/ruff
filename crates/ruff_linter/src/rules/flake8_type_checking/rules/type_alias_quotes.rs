@@ -10,8 +10,8 @@ use ruff_text_size::Ranged;
 use crate::checkers::ast::Checker;
 use crate::registry::Rule;
 use crate::rules::flake8_type_checking::helpers::quote_type_expression;
-use crate::settings::types::PythonVersion;
 use crate::settings::LinterSettings;
+use ruff_python_ast::PythonVersion;
 
 /// ## What it does
 /// Checks if [PEP 613] explicit type aliases contain references to
@@ -113,9 +113,9 @@ impl Violation for UnquotedTypeAlias {
 /// This rule only applies to type aliases in non-stub files. For removing quotes in other
 /// contexts or in stub files, see:
 ///
-/// - [`quoted-annotation-in-stub`](quoted-annotation-in-stub.md): A rule that
+/// - [`quoted-annotation-in-stub`][PYI020]: A rule that
 ///   removes all quoted annotations from stub files
-/// - [`quoted-annotation`](quoted-annotation.md): A rule that removes unnecessary quotes
+/// - [`quoted-annotation`][UP037]: A rule that removes unnecessary quotes
 ///   from *annotations* in runtime files.
 ///
 /// ## References
@@ -126,6 +126,8 @@ impl Violation for UnquotedTypeAlias {
 /// [PEP 604]: https://peps.python.org/pep-0604/
 /// [PEP 613]: https://peps.python.org/pep-0613/
 /// [PEP 695]: https://peps.python.org/pep-0695/#generic-type-alias
+/// [PYI020]: https://docs.astral.sh/ruff/rules/quoted-annotation-in-stub/
+/// [UP037]: https://docs.astral.sh/ruff/rules/quoted-annotation/
 #[derive(ViolationMetadata)]
 pub(crate) struct QuotedTypeAlias;
 
@@ -175,6 +177,7 @@ pub(crate) fn unquoted_type_alias(checker: &Checker, binding: &Binding) -> Optio
         checker.semantic(),
         checker.stylist(),
         checker.locator(),
+        checker.default_string_flags(),
     );
     let mut diagnostics = Vec::with_capacity(names.len());
     for name in names {
@@ -264,7 +267,7 @@ fn collect_typing_references<'a>(
 
 /// TC008
 pub(crate) fn quoted_type_alias(
-    checker: &mut Checker,
+    checker: &Checker,
     expr: &Expr,
     annotation_expr: &ast::ExprStringLiteral,
 ) {
@@ -289,15 +292,12 @@ pub(crate) fn quoted_type_alias(
     let range = annotation_expr.range();
     let mut diagnostic = Diagnostic::new(QuotedTypeAlias, range);
     let edit = Edit::range_replacement(annotation_expr.value.to_string(), range);
-    if checker
-        .comment_ranges()
-        .has_comments(expr, checker.source())
-    {
+    if checker.comment_ranges().intersects(range) {
         diagnostic.set_fix(Fix::unsafe_edit(edit));
     } else {
         diagnostic.set_fix(Fix::safe_edit(edit));
     }
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }
 
 /// Traverses the type expression and checks if the expression can safely
@@ -313,7 +313,7 @@ fn quotes_are_unremovable(
         }) => {
             match op {
                 Operator::BitOr => {
-                    if settings.target_version < PythonVersion::Py310 {
+                    if settings.target_version < PythonVersion::PY310 {
                         return true;
                     }
                     quotes_are_unremovable(semantic, left, settings)

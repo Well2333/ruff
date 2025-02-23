@@ -805,56 +805,6 @@ Rules to disable by default. See [the documentation](https://docs.astral.sh/ruff
     }
     ```
 
-### `extendIgnore`
-
-Rules to disable in addition to those in [`lint.ignore`](#ignore).
-
-**Default value**: `null`
-
-**Type**: `string[]`
-
-**Example usage**:
-
-=== "VS Code"
-
-    ```json
-    {
-        "ruff.lint.extendIgnore": ["W1"]
-    }
-    ```
-
-=== "Neovim"
-
-    ```lua
-    require('lspconfig').ruff.setup {
-      init_options = {
-        settings = {
-          lint = {
-            extendIgnore = {"W1"}
-          }
-        }
-      }
-    }
-    ```
-
-=== "Zed"
-
-    ```json
-    {
-      "lsp": {
-        "ruff": {
-          "initialization_options": {
-            "settings": {
-              "lint": {
-                "extendIgnore": ["W1"]
-              }
-            }
-          }
-        }
-      }
-    }
-    ```
-
 ## `format`
 
 Settings specific to the Ruff formatter.
@@ -932,6 +882,12 @@ Whether to enable the Ruff extension. Modifying this setting requires restarting
 
 ### `format.args`
 
+!!! warning "Deprecated"
+
+    This setting is only used by [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) which is
+    deprecated in favor of the native language server. Refer to the [migration
+    guide](migration.md) for more information.
+
 _**This setting is not used by the native language server.**_
 
 Additional arguments to pass to the Ruff formatter.
@@ -949,6 +905,12 @@ Additional arguments to pass to the Ruff formatter.
 ```
 
 ### `ignoreStandardLibrary`
+
+!!! warning "Deprecated"
+
+    This setting is only used by [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) which is
+    deprecated in favor of the native language server. Refer to the [migration
+    guide](migration.md) for more information.
 
 _**This setting is not used by the native language server.**_
 
@@ -1010,6 +972,12 @@ This setting depends on the [`ruff.nativeServer`](#nativeserver) setting:
 
 ### `lint.args`
 
+!!! warning "Deprecated"
+
+    This setting is only used by [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) which is
+    deprecated in favor of the native language server. Refer to the [migration
+    guide](migration.md) for more information.
+
 _**This setting is not used by the native language server.**_
 
 Additional arguments to pass to the Ruff linter.
@@ -1027,6 +995,12 @@ Additional arguments to pass to the Ruff linter.
 ```
 
 ### `lint.run`
+
+!!! warning "Deprecated"
+
+    This setting is only used by [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) which is
+    deprecated in favor of the native language server. Refer to the [migration
+    guide](migration.md) for more information.
 
 _**This setting is not used by the native language server.**_
 
@@ -1095,6 +1069,12 @@ The first executable in the list which is exists is used. This setting takes pre
 ```
 
 ### `showNotifications`
+
+!!! warning "Deprecated"
+
+    This setting is only used by [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) which is
+    deprecated in favor of the native language server. Refer to the [migration
+    guide](migration.md) for more information.
 
 Setting to control when a notification is shown.
 

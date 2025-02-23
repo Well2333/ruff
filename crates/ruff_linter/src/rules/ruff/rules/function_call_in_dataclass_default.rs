@@ -3,7 +3,9 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::name::{QualifiedName, UnqualifiedName};
-use ruff_python_semantic::analyze::typing::is_immutable_func;
+use ruff_python_semantic::analyze::typing::{
+    is_immutable_annotation, is_immutable_func, is_immutable_newtype_call,
+};
 use ruff_text_size::Ranged;
 
 use crate::checkers::ast::Checker;
@@ -23,6 +25,9 @@ use crate::rules::ruff::rules::helpers::{
 ///
 /// If a field needs to be initialized with a mutable object, use the
 /// `field(default_factory=...)` pattern.
+///
+/// Attributes whose default arguments are `NewType` calls
+/// where the original type is immutable are ignored.
 ///
 /// ## Examples
 /// ```python
@@ -71,10 +76,7 @@ impl Violation for FunctionCallInDataclassDefaultArgument {
 }
 
 /// RUF009
-pub(crate) fn function_call_in_dataclass_default(
-    checker: &mut Checker,
-    class_def: &ast::StmtClassDef,
-) {
+pub(crate) fn function_call_in_dataclass_default(checker: &Checker, class_def: &ast::StmtClassDef) {
     let semantic = checker.semantic();
 
     let Some((dataclass_kind, _)) = dataclass_kind(class_def, semantic) else {
@@ -134,9 +136,13 @@ pub(crate) fn function_call_in_dataclass_default(
         }
 
         if is_field
+            || is_immutable_annotation(annotation, checker.semantic(), &extend_immutable_calls)
             || is_class_var_annotation(annotation, checker.semantic())
             || is_immutable_func(func, checker.semantic(), &extend_immutable_calls)
             || is_descriptor_class(func, checker.semantic())
+            || func.as_name_expr().is_some_and(|name| {
+                is_immutable_newtype_call(name, checker.semantic(), &extend_immutable_calls)
+            })
         {
             continue;
         }
@@ -146,7 +152,7 @@ pub(crate) fn function_call_in_dataclass_default(
         };
         let diagnostic = Diagnostic::new(kind, expr.range());
 
-        checker.diagnostics.push(diagnostic);
+        checker.report_diagnostic(diagnostic);
     }
 }
 

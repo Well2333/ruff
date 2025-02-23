@@ -26,7 +26,7 @@ impl<'db> SubclassOfType<'db> {
             ClassBase::Class(class) => {
                 if class.is_final(db) {
                     Type::ClassLiteral(ClassLiteralType { class })
-                } else if class.is_known(db, KnownClass::Object) {
+                } else if class.is_object(db) {
                     KnownClass::Type.to_instance(db)
                 } else {
                     Type::SubclassOf(Self { subclass_of })
@@ -64,8 +64,8 @@ impl<'db> SubclassOfType<'db> {
         !self.is_dynamic()
     }
 
-    pub(crate) fn member(self, db: &'db dyn Db, name: &str) -> Symbol<'db> {
-        Type::from(self.subclass_of).member(db, name)
+    pub(crate) fn static_member(self, db: &'db dyn Db, name: &str) -> Symbol<'db> {
+        Type::from(self.subclass_of).static_member(db, name)
     }
 
     /// Return `true` if `self` is a subtype of `other`.

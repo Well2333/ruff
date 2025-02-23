@@ -41,7 +41,7 @@ static types can be assignable to gradual types):
 
 ```py
 from knot_extensions import static_assert, is_assignable_to, Unknown
-from typing import Any
+from typing import Any, Literal
 
 static_assert(is_assignable_to(Unknown, Literal[1]))
 static_assert(is_assignable_to(Any, Literal[1]))
@@ -263,15 +263,12 @@ static_assert(not is_assignable_to(int, Not[int]))
 static_assert(not is_assignable_to(int, Not[Literal[1]]))
 
 static_assert(not is_assignable_to(Intersection[Any, Parent], Unrelated))
+static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Any]))
+static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Not[Any]]))
 
 # TODO: The following assertions should not fail (see https://github.com/astral-sh/ruff/issues/14899)
 # error: [static-assert-error]
 static_assert(is_assignable_to(Intersection[Any, int], int))
-
-# error: [static-assert-error]
-static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Any]))
-# error: [static-assert-error]
-static_assert(is_assignable_to(Intersection[Unrelated, Any], Intersection[Unrelated, Not[Any]]))
 # error: [static-assert-error]
 static_assert(is_assignable_to(Intersection[Unrelated, Any], Not[tuple[Unrelated, Any]]))
 ```
@@ -336,7 +333,7 @@ assignable to any arbitrary type.
 
 ```py
 from knot_extensions import static_assert, is_assignable_to, Unknown
-from typing_extensions import Never, Any
+from typing_extensions import Never, Any, Literal
 
 static_assert(is_assignable_to(Never, str))
 static_assert(is_assignable_to(Never, Literal[1]))
