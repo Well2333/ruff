@@ -816,6 +816,7 @@ if True:
 
         ----- stderr -----
         ruff failed
+          Cause: Failed to load configuration `[RUFF-TOML-PATH]`
           Cause: Failed to parse [RUFF-TOML-PATH]
           Cause: TOML parse error at line 1, column 1
           |
@@ -855,6 +856,7 @@ format = "json"
 
         ----- stderr -----
         ruff failed
+          Cause: Failed to load configuration `[RUFF-TOML-PATH]`
           Cause: Failed to parse [RUFF-TOML-PATH]
           Cause: TOML parse error at line 2, column 10
           |
@@ -924,7 +926,7 @@ def say_hy(name: str):
     warning: The `format.indent-style="tab"` option is incompatible with `D206`, with requires space-based indentation. We recommend disabling these rules when using the formatter, which enforces a consistent indentation style. Alternatively, set the `format.indent-style` option to `"space"`.
     warning: The `flake8-quotes.inline-quotes="single"` option is incompatible with the formatter's `format.quote-style="double"`. We recommend disabling `Q000` and `Q003` when using the formatter, which enforces a consistent quote style. Alternatively, set both options to either `"single"` or `"double"`.
     warning: The `flake8-quotes.multiline-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q001` when using the formatter, which enforces double quotes for multiline strings. Alternatively, set the `flake8-quotes.multiline-quotes` option to `"double"`.`
-    warning: The `flake8-quotes.multiline-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `"double"`.`
+    warning: The `flake8-quotes.docstring-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `"double"`.`
     warning: The isort option `isort.lines-after-imports` with a value other than `-1`, `1` or `2` is incompatible with the formatter. To avoid unexpected behavior, we recommend setting the option to one of: `2`, `1`, or `-1` (default).
     warning: The isort option `isort.lines-between-types` with a value greater than 1 is incompatible with the formatter. To avoid unexpected behavior, we recommend setting the option to one of: `1` or `0` (default).
     warning: The isort option `isort.force-wrap-aliases` is incompatible with the formatter `format.skip-magic-trailing-comma=true` option. To avoid unexpected behavior, we recommend either setting `isort.force-wrap-aliases=false` or `format.skip-magic-trailing-comma=false`.
@@ -983,7 +985,7 @@ def say_hy(name: str):
     warning: The `format.indent-style="tab"` option is incompatible with `D206`, with requires space-based indentation. We recommend disabling these rules when using the formatter, which enforces a consistent indentation style. Alternatively, set the `format.indent-style` option to `"space"`.
     warning: The `flake8-quotes.inline-quotes="single"` option is incompatible with the formatter's `format.quote-style="double"`. We recommend disabling `Q000` and `Q003` when using the formatter, which enforces a consistent quote style. Alternatively, set both options to either `"single"` or `"double"`.
     warning: The `flake8-quotes.multiline-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q001` when using the formatter, which enforces double quotes for multiline strings. Alternatively, set the `flake8-quotes.multiline-quotes` option to `"double"`.`
-    warning: The `flake8-quotes.multiline-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `"double"`.`
+    warning: The `flake8-quotes.docstring-quotes="single"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `"double"`.`
     warning: The isort option `isort.lines-after-imports` with a value other than `-1`, `1` or `2` is incompatible with the formatter. To avoid unexpected behavior, we recommend setting the option to one of: `2`, `1`, or `-1` (default).
     warning: The isort option `isort.lines-between-types` with a value greater than 1 is incompatible with the formatter. To avoid unexpected behavior, we recommend setting the option to one of: `1` or `0` (default).
     warning: The isort option `isort.force-wrap-aliases` is incompatible with the formatter `format.skip-magic-trailing-comma=true` option. To avoid unexpected behavior, we recommend either setting `isort.force-wrap-aliases=false` or `format.skip-magic-trailing-comma=false`.
@@ -2083,4 +2085,51 @@ fn range_formatting_notebook() {
     ----- stderr -----
     error: Failed to format main.ipynb: Range formatting isn't supported for notebooks.
     ");
+}
+
+/// Test that the formatter respects `per-file-target-version`. Context managers can't be
+/// parenthesized like this before Python 3.10.
+///
+/// Adapted from <https://github.com/python/cpython/issues/56991#issuecomment-1093555135>
+#[test]
+fn per_file_target_version_formatter() {
+    // without `per-file-target-version` this should not be reformatted in the same way
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(["format", "--isolated", "--stdin-filename", "test.py", "--target-version=py38"])
+        .arg("-")
+        .pass_stdin(r#"
+with open("a_really_long_foo") as foo, open("a_really_long_bar") as bar, open("a_really_long_baz") as baz:
+    pass
+"#), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    with open("a_really_long_foo") as foo, open("a_really_long_bar") as bar, open(
+        "a_really_long_baz"
+    ) as baz:
+        pass
+
+    ----- stderr -----
+    "#);
+
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(["format", "--isolated", "--stdin-filename", "test.py", "--target-version=py38"])
+        .args(["--config", r#"per-file-target-version = {"test.py" = "py311"}"#])
+        .arg("-")
+        .pass_stdin(r#"
+with open("a_really_long_foo") as foo, open("a_really_long_bar") as bar, open("a_really_long_baz") as baz:
+    pass
+"#), @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    with (
+        open("a_really_long_foo") as foo,
+        open("a_really_long_bar") as bar,
+        open("a_really_long_baz") as baz,
+    ):
+        pass
+
+    ----- stderr -----
+    "#);
 }

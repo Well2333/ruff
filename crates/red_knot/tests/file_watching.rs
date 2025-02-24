@@ -4,15 +4,19 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
-use red_knot_python_semantic::{resolve_module, ModuleName, Program, PythonVersion, SitePackages};
-use red_knot_workspace::db::{Db, ProjectDatabase};
-use red_knot_workspace::project::settings::{Configuration, SearchPathConfiguration};
-use red_knot_workspace::project::ProjectMetadata;
-use red_knot_workspace::watch::{directory_watcher, ChangeEvent, ProjectWatcher};
+use red_knot_project::metadata::options::{EnvironmentOptions, Options};
+use red_knot_project::metadata::pyproject::{PyProject, Tool};
+use red_knot_project::metadata::value::{RangedValue, RelativePathBuf};
+use red_knot_project::watch::{directory_watcher, ChangeEvent, ProjectWatcher};
+use red_knot_project::{Db, ProjectDatabase, ProjectMetadata};
+use red_knot_python_semantic::{resolve_module, ModuleName, PythonPlatform};
 use ruff_db::files::{system_path_to_file, File, FileError};
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use ruff_db::system::{
+    OsSystem, System, SystemPath, SystemPathBuf, UserConfigDirectoryOverrideGuard,
+};
 use ruff_db::Upcast;
+use ruff_python_ast::PythonVersion;
 
 struct TestCase {
     db: ProjectDatabase,
@@ -22,7 +26,6 @@ struct TestCase {
     /// We need to hold on to it in the test case or the temp files get deleted.
     _temp_dir: tempfile::TempDir,
     root_dir: SystemPathBuf,
-    configuration: Configuration,
 }
 
 impl TestCase {
@@ -47,7 +50,7 @@ impl TestCase {
         #[track_caller]
         fn panic_with_formatted_events(events: Vec<ChangeEvent>) -> Vec<ChangeEvent> {
             panic!(
-                "Didn't observe expected change:\n{}",
+                "Didn't observe the expected event. The following events occurred:\n{}",
                 events
                     .into_iter()
                     .map(|event| format!("  - {event:?}"))
@@ -112,19 +115,44 @@ impl TestCase {
         Ok(all_events)
     }
 
-    fn take_watch_changes(&self) -> Vec<ChangeEvent> {
-        self.try_take_watch_changes(Duration::from_secs(10))
+    fn take_watch_changes<M: MatchEvent>(&self, matcher: M) -> Vec<ChangeEvent> {
+        self.try_take_watch_changes(matcher, Duration::from_secs(10))
             .expect("Expected watch changes but observed none")
     }
 
-    fn try_take_watch_changes(&self, timeout: Duration) -> Option<Vec<ChangeEvent>> {
-        let watcher = self.watcher.as_ref()?;
+    fn try_take_watch_changes<M: MatchEvent>(
+        &self,
+        mut matcher: M,
+        timeout: Duration,
+    ) -> Result<Vec<ChangeEvent>, Vec<ChangeEvent>> {
+        let watcher = self
+            .watcher
+            .as_ref()
+            .expect("Cannot call `try_take_watch_changes` after `stop_watch`");
 
-        let mut all_events = self
-            .changes_receiver
-            .recv_timeout(timeout)
-            .unwrap_or_default();
-        watcher.flush();
+        let start = Instant::now();
+        let mut all_events = Vec::new();
+
+        loop {
+            let events = self
+                .changes_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap_or_default();
+
+            if events
+                .iter()
+                .any(|event| matcher.match_event(event) || event.is_rescan())
+            {
+                all_events.extend(events);
+                break;
+            }
+
+            all_events.extend(events);
+
+            if start.elapsed() > timeout {
+                return Err(all_events);
+            }
+        }
 
         while let Ok(event) = self
             .changes_receiver
@@ -134,26 +162,28 @@ impl TestCase {
             watcher.flush();
         }
 
-        if all_events.is_empty() {
-            return None;
-        }
-        Some(all_events)
+        Ok(all_events)
     }
 
     fn apply_changes(&mut self, changes: Vec<ChangeEvent>) {
-        self.db.apply_changes(changes, Some(&self.configuration));
+        self.db.apply_changes(changes, None);
     }
 
-    fn update_search_path_settings(
-        &mut self,
-        configuration: SearchPathConfiguration,
-    ) -> anyhow::Result<()> {
-        let program = Program::get(self.db());
+    fn update_options(&mut self, options: Options) -> anyhow::Result<()> {
+        std::fs::write(
+            self.project_path("pyproject.toml").as_std_path(),
+            toml::to_string(&PyProject {
+                project: None,
+                tool: Some(Tool {
+                    knot: Some(options),
+                }),
+            })
+            .context("Failed to serialize options")?,
+        )
+        .context("Failed to write configuration")?;
 
-        let new_settings = configuration.to_settings(self.db.project().root(&self.db));
-        self.configuration.search_paths = configuration;
-
-        program.update_search_paths(&mut self.db, &new_settings)?;
+        let changes = self.take_watch_changes(event_for_file("pyproject.toml"));
+        self.apply_changes(changes);
 
         if let Some(watcher) = &mut self.watcher {
             watcher.update(&self.db);
@@ -193,17 +223,44 @@ where
 }
 
 trait SetupFiles {
-    fn setup(self, root_path: &SystemPath, project_path: &SystemPath) -> anyhow::Result<()>;
+    fn setup(self, context: &SetupContext) -> anyhow::Result<()>;
+}
+
+struct SetupContext<'a> {
+    system: &'a OsSystem,
+    root_path: &'a SystemPath,
+}
+
+impl<'a> SetupContext<'a> {
+    fn system(&self) -> &'a OsSystem {
+        self.system
+    }
+
+    fn join_project_path(&self, relative: impl AsRef<SystemPath>) -> SystemPathBuf {
+        self.project_path().join(relative)
+    }
+
+    fn project_path(&self) -> &SystemPath {
+        self.system.current_directory()
+    }
+
+    fn root_path(&self) -> &'a SystemPath {
+        self.root_path
+    }
+
+    fn join_root_path(&self, relative: impl AsRef<SystemPath>) -> SystemPathBuf {
+        self.root_path().join(relative)
+    }
 }
 
 impl<const N: usize, P> SetupFiles for [(P, &'static str); N]
 where
     P: AsRef<SystemPath>,
 {
-    fn setup(self, _root_path: &SystemPath, project_path: &SystemPath) -> anyhow::Result<()> {
+    fn setup(self, context: &SetupContext) -> anyhow::Result<()> {
         for (relative_path, content) in self {
             let relative_path = relative_path.as_ref();
-            let absolute_path = project_path.join(relative_path);
+            let absolute_path = context.join_project_path(relative_path);
             if let Some(parent) = absolute_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!("Failed to create parent directory for file `{relative_path}`")
@@ -223,10 +280,10 @@ where
 
 impl<F> SetupFiles for F
 where
-    F: FnOnce(&SystemPath, &SystemPath) -> anyhow::Result<()>,
+    F: FnOnce(&SetupContext) -> anyhow::Result<()>,
 {
-    fn setup(self, root_path: &SystemPath, project_path: &SystemPath) -> anyhow::Result<()> {
-        self(root_path, project_path)
+    fn setup(self, context: &SetupContext) -> anyhow::Result<()> {
+        self(context)
     }
 }
 
@@ -234,14 +291,12 @@ fn setup<F>(setup_files: F) -> anyhow::Result<TestCase>
 where
     F: SetupFiles,
 {
-    setup_with_search_paths(setup_files, |_root, _project_path| {
-        SearchPathConfiguration::default()
-    })
+    setup_with_options(setup_files, |_context| None)
 }
 
-fn setup_with_search_paths<F>(
+fn setup_with_options<F>(
     setup_files: F,
-    create_search_paths: impl FnOnce(&SystemPath, &SystemPath) -> SearchPathConfiguration,
+    create_options: impl FnOnce(&SetupContext) -> Option<Options>,
 ) -> anyhow::Result<TestCase>
 where
     F: SetupFiles,
@@ -269,37 +324,44 @@ where
     std::fs::create_dir_all(project_path.as_std_path())
         .with_context(|| format!("Failed to create project directory `{project_path}`"))?;
 
+    let system = OsSystem::new(&project_path);
+    let setup_context = SetupContext {
+        system: &system,
+        root_path: &root_path,
+    };
+
     setup_files
-        .setup(&root_path, &project_path)
+        .setup(&setup_context)
         .context("Failed to setup test files")?;
 
-    let system = OsSystem::new(&project_path);
+    if let Some(options) = create_options(&setup_context) {
+        std::fs::write(
+            project_path.join("pyproject.toml").as_std_path(),
+            toml::to_string(&PyProject {
+                project: None,
+                tool: Some(Tool {
+                    knot: Some(options),
+                }),
+            })
+            .context("Failed to serialize options")?,
+        )
+        .context("Failed to write configuration")?;
+    }
 
-    let search_paths = create_search_paths(&root_path, &project_path);
+    let mut project = ProjectMetadata::discover(&project_path, &system)?;
+    project.apply_configuration_files(&system)?;
 
-    for path in search_paths
+    let program_settings = project.to_program_settings(&system);
+
+    for path in program_settings
+        .search_paths
         .extra_paths
         .iter()
-        .flatten()
-        .chain(search_paths.typeshed.iter())
-        .chain(search_paths.site_packages.iter().flat_map(|site_packages| {
-            if let SitePackages::Known(path) = site_packages {
-                path.as_slice()
-            } else {
-                &[]
-            }
-        }))
+        .chain(program_settings.search_paths.custom_typeshed.as_ref())
     {
         std::fs::create_dir_all(path.as_std_path())
             .with_context(|| format!("Failed to create search path `{path}`"))?;
     }
-
-    let configuration = Configuration {
-        python_version: Some(PythonVersion::PY312),
-        search_paths,
-    };
-
-    let project = ProjectMetadata::discover(&project_path, &system, Some(&configuration))?;
 
     let db = ProjectDatabase::new(project, system)?;
 
@@ -316,12 +378,12 @@ where
         watcher: Some(watcher),
         _temp_dir: temp_dir,
         root_dir: root_path,
-        configuration,
     };
 
     // Sometimes the file watcher reports changes for events that happened before the watcher was started.
     // Do a best effort at dropping these events.
-    test_case.try_take_watch_changes(Duration::from_millis(100));
+    let _ =
+        test_case.try_take_watch_changes(|_event: &ChangeEvent| true, Duration::from_millis(100));
 
     Ok(test_case)
 }
@@ -762,13 +824,17 @@ fn directory_deleted() -> anyhow::Result<()> {
 
 #[test]
 fn search_path() -> anyhow::Result<()> {
-    let mut case =
-        setup_with_search_paths([("bar.py", "import sub.a")], |root_path, _project_path| {
-            SearchPathConfiguration {
-                site_packages: Some(SitePackages::Known(vec![root_path.join("site_packages")])),
-                ..SearchPathConfiguration::default()
-            }
-        })?;
+    let mut case = setup_with_options([("bar.py", "import sub.a")], |context| {
+        Some(Options {
+            environment: Some(EnvironmentOptions {
+                extra_paths: Some(vec![RelativePathBuf::cli(
+                    context.join_root_path("site_packages"),
+                )]),
+                ..EnvironmentOptions::default()
+            }),
+            ..Options::default()
+        })
+    })?;
 
     let site_packages = case.root_path().join("site_packages");
 
@@ -802,9 +868,12 @@ fn add_search_path() -> anyhow::Result<()> {
     assert!(resolve_module(case.db().upcast(), &ModuleName::new_static("a").unwrap()).is_none());
 
     // Register site-packages as a search path.
-    case.update_search_path_settings(SearchPathConfiguration {
-        site_packages: Some(SitePackages::Known(vec![site_packages.clone()])),
-        ..SearchPathConfiguration::default()
+    case.update_options(Options {
+        environment: Some(EnvironmentOptions {
+            extra_paths: Some(vec![RelativePathBuf::cli("site_packages")]),
+            ..EnvironmentOptions::default()
+        }),
+        ..Options::default()
     })
     .expect("Search path settings to be valid");
 
@@ -821,19 +890,24 @@ fn add_search_path() -> anyhow::Result<()> {
 
 #[test]
 fn remove_search_path() -> anyhow::Result<()> {
-    let mut case =
-        setup_with_search_paths([("bar.py", "import sub.a")], |root_path, _project_path| {
-            SearchPathConfiguration {
-                site_packages: Some(SitePackages::Known(vec![root_path.join("site_packages")])),
-                ..SearchPathConfiguration::default()
-            }
-        })?;
+    let mut case = setup_with_options([("bar.py", "import sub.a")], |context| {
+        Some(Options {
+            environment: Some(EnvironmentOptions {
+                extra_paths: Some(vec![RelativePathBuf::cli(
+                    context.join_root_path("site_packages"),
+                )]),
+                ..EnvironmentOptions::default()
+            }),
+            ..Options::default()
+        })
+    })?;
 
     // Remove site packages from the search path settings.
     let site_packages = case.root_path().join("site_packages");
-    case.update_search_path_settings(SearchPathConfiguration {
-        site_packages: None,
-        ..SearchPathConfiguration::default()
+
+    case.update_options(Options {
+        environment: None,
+        ..Options::default()
     })
     .expect("Search path settings to be valid");
 
@@ -847,22 +921,95 @@ fn remove_search_path() -> anyhow::Result<()> {
 }
 
 #[test]
+fn change_python_version_and_platform() -> anyhow::Result<()> {
+    let mut case = setup_with_options(
+        // `sys.last_exc` is a Python 3.12 only feature
+        // `os.getegid()` is Unix only
+        [(
+            "bar.py",
+            r#"
+import sys
+import os
+print(sys.last_exc, os.getegid())
+"#,
+        )],
+        |_context| {
+            Some(Options {
+                environment: Some(EnvironmentOptions {
+                    python_version: Some(RangedValue::cli(PythonVersion::PY311)),
+                    python_platform: Some(RangedValue::cli(PythonPlatform::Identifier(
+                        "win32".to_string(),
+                    ))),
+                    ..EnvironmentOptions::default()
+                }),
+                ..Options::default()
+            })
+        },
+    )?;
+
+    let diagnostics = case.db.check().context("Failed to check project.")?;
+
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(
+        diagnostics[0].message(),
+        "Type `<module 'sys'>` has no attribute `last_exc`"
+    );
+    assert_eq!(
+        diagnostics[1].message(),
+        "Type `<module 'os'>` has no attribute `getegid`"
+    );
+
+    // Change the python version
+    case.update_options(Options {
+        environment: Some(EnvironmentOptions {
+            python_version: Some(RangedValue::cli(PythonVersion::PY312)),
+            python_platform: Some(RangedValue::cli(PythonPlatform::Identifier(
+                "linux".to_string(),
+            ))),
+            ..EnvironmentOptions::default()
+        }),
+        ..Options::default()
+    })
+    .expect("Search path settings to be valid");
+
+    let diagnostics = case.db.check().context("Failed to check project.")?;
+    assert!(diagnostics.is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn changed_versions_file() -> anyhow::Result<()> {
-    let mut case = setup_with_search_paths(
-        |root_path: &SystemPath, project_path: &SystemPath| {
-            std::fs::write(project_path.join("bar.py").as_std_path(), "import sub.a")?;
-            std::fs::create_dir_all(root_path.join("typeshed/stdlib").as_std_path())?;
-            std::fs::write(root_path.join("typeshed/stdlib/VERSIONS").as_std_path(), "")?;
+    let mut case = setup_with_options(
+        |context: &SetupContext| {
             std::fs::write(
-                root_path.join("typeshed/stdlib/os.pyi").as_std_path(),
+                context.join_project_path("bar.py").as_std_path(),
+                "import sub.a",
+            )?;
+            std::fs::create_dir_all(context.join_root_path("typeshed/stdlib").as_std_path())?;
+            std::fs::write(
+                context
+                    .join_root_path("typeshed/stdlib/VERSIONS")
+                    .as_std_path(),
+                "",
+            )?;
+            std::fs::write(
+                context
+                    .join_root_path("typeshed/stdlib/os.pyi")
+                    .as_std_path(),
                 "# not important",
             )?;
 
             Ok(())
         },
-        |root_path, _project_path| SearchPathConfiguration {
-            typeshed: Some(root_path.join("typeshed")),
-            ..SearchPathConfiguration::default()
+        |context| {
+            Some(Options {
+                environment: Some(EnvironmentOptions {
+                    typeshed: Some(RelativePathBuf::cli(context.join_root_path("typeshed"))),
+                    ..EnvironmentOptions::default()
+                }),
+                ..Options::default()
+            })
         },
     )?;
 
@@ -909,12 +1056,12 @@ fn changed_versions_file() -> anyhow::Result<()> {
 /// we're seeing is that Windows only emits a single event, similar to Linux.
 #[test]
 fn hard_links_in_project() -> anyhow::Result<()> {
-    let mut case = setup(|_root: &SystemPath, project: &SystemPath| {
-        let foo_path = project.join("foo.py");
+    let mut case = setup(|context: &SetupContext| {
+        let foo_path = context.join_project_path("foo.py");
         std::fs::write(foo_path.as_std_path(), "print('Version 1')")?;
 
         // Create a hardlink to `foo`
-        let bar_path = project.join("bar.py");
+        let bar_path = context.join_project_path("bar.py");
         std::fs::hard_link(foo_path.as_std_path(), bar_path.as_std_path())
             .context("Failed to create hard link from foo.py -> bar.py")?;
 
@@ -980,12 +1127,12 @@ fn hard_links_in_project() -> anyhow::Result<()> {
     ignore = "windows doesn't support observing changes to hard linked files."
 )]
 fn hard_links_to_target_outside_project() -> anyhow::Result<()> {
-    let mut case = setup(|root: &SystemPath, project: &SystemPath| {
-        let foo_path = root.join("foo.py");
+    let mut case = setup(|context: &SetupContext| {
+        let foo_path = context.join_root_path("foo.py");
         std::fs::write(foo_path.as_std_path(), "print('Version 1')")?;
 
         // Create a hardlink to `foo`
-        let bar_path = project.join("bar.py");
+        let bar_path = context.join_project_path("bar.py");
         std::fs::hard_link(foo_path.as_std_path(), bar_path.as_std_path())
             .context("Failed to create hard link from foo.py -> bar.py")?;
 
@@ -1088,9 +1235,9 @@ mod unix {
         ignore = "FSEvents doesn't emit change events for symlinked directories outside of the watched paths."
     )]
     fn symlink_target_outside_watched_paths() -> anyhow::Result<()> {
-        let mut case = setup(|root: &SystemPath, project: &SystemPath| {
+        let mut case = setup(|context: &SetupContext| {
             // Set up the symlink target.
-            let link_target = root.join("bar");
+            let link_target = context.join_root_path("bar");
             std::fs::create_dir_all(link_target.as_std_path())
                 .context("Failed to create link target directory")?;
             let baz_original = link_target.join("baz.py");
@@ -1098,7 +1245,7 @@ mod unix {
                 .context("Failed to write link target file")?;
 
             // Create a symlink inside the project
-            let bar = project.join("bar");
+            let bar = context.join_project_path("bar");
             std::os::unix::fs::symlink(link_target.as_std_path(), bar.as_std_path())
                 .context("Failed to create symlink to bar package")?;
 
@@ -1127,7 +1274,7 @@ mod unix {
         update_file(baz_original, "def baz(): print('Version 2')")
             .context("Failed to update bar/baz.py")?;
 
-        let changes = case.take_watch_changes();
+        let changes = case.take_watch_changes(event_for_file("baz.py"));
 
         case.apply_changes(changes);
 
@@ -1169,9 +1316,9 @@ mod unix {
     /// ```
     #[test]
     fn symlink_inside_project() -> anyhow::Result<()> {
-        let mut case = setup(|_root: &SystemPath, project: &SystemPath| {
+        let mut case = setup(|context: &SetupContext| {
             // Set up the symlink target.
-            let link_target = project.join("patched/bar");
+            let link_target = context.join_project_path("patched/bar");
             std::fs::create_dir_all(link_target.as_std_path())
                 .context("Failed to create link target directory")?;
             let baz_original = link_target.join("baz.py");
@@ -1179,7 +1326,7 @@ mod unix {
                 .context("Failed to write link target file")?;
 
             // Create a symlink inside site-packages
-            let bar_in_project = project.join("bar");
+            let bar_in_project = context.join_project_path("bar");
             std::os::unix::fs::symlink(link_target.as_std_path(), bar_in_project.as_std_path())
                 .context("Failed to create symlink to bar package")?;
 
@@ -1259,10 +1406,10 @@ mod unix {
     /// ```
     #[test]
     fn symlinked_module_search_path() -> anyhow::Result<()> {
-        let mut case = setup_with_search_paths(
-            |root: &SystemPath, project: &SystemPath| {
+        let mut case = setup_with_options(
+            |context: &SetupContext| {
                 // Set up the symlink target.
-                let site_packages = root.join("site-packages");
+                let site_packages = context.join_root_path("site-packages");
                 let bar = site_packages.join("bar");
                 std::fs::create_dir_all(bar.as_std_path())
                     .context("Failed to create bar directory")?;
@@ -1271,7 +1418,8 @@ mod unix {
                     .context("Failed to write baz.py")?;
 
                 // Symlink the site packages in the venv to the global site packages
-                let venv_site_packages = project.join(".venv/lib/python3.12/site-packages");
+                let venv_site_packages =
+                    context.join_project_path(".venv/lib/python3.12/site-packages");
                 std::fs::create_dir_all(venv_site_packages.parent().unwrap())
                     .context("Failed to create .venv directory")?;
                 std::os::unix::fs::symlink(
@@ -1282,11 +1430,17 @@ mod unix {
 
                 Ok(())
             },
-            |_root, project| SearchPathConfiguration {
-                site_packages: Some(SitePackages::Known(vec![
-                    project.join(".venv/lib/python3.12/site-packages")
-                ])),
-                ..SearchPathConfiguration::default()
+            |_context| {
+                Some(Options {
+                    environment: Some(EnvironmentOptions {
+                        extra_paths: Some(vec![RelativePathBuf::cli(
+                            ".venv/lib/python3.12/site-packages",
+                        )]),
+                        python_version: Some(RangedValue::cli(PythonVersion::PY312)),
+                        ..EnvironmentOptions::default()
+                    }),
+                    ..Options::default()
+                })
             },
         )?;
 
@@ -1346,9 +1500,9 @@ mod unix {
 
 #[test]
 fn nested_projects_delete_root() -> anyhow::Result<()> {
-    let mut case = setup(|root: &SystemPath, project_root: &SystemPath| {
+    let mut case = setup(|context: &SetupContext| {
         std::fs::write(
-            project_root.join("pyproject.toml").as_std_path(),
+            context.join_project_path("pyproject.toml").as_std_path(),
             r#"
             [project]
             name = "inner"
@@ -1358,7 +1512,7 @@ fn nested_projects_delete_root() -> anyhow::Result<()> {
         )?;
 
         std::fs::write(
-            root.join("pyproject.toml").as_std_path(),
+            context.join_root_path("pyproject.toml").as_std_path(),
             r#"
             [project]
             name = "outer"
@@ -1380,6 +1534,82 @@ fn nested_projects_delete_root() -> anyhow::Result<()> {
 
     // It should now pick up the outer project.
     assert_eq!(case.db().project().root(case.db()), case.root_path());
+
+    Ok(())
+}
+
+#[test]
+fn changes_to_user_configuration() -> anyhow::Result<()> {
+    let mut _config_dir_override: Option<UserConfigDirectoryOverrideGuard> = None;
+
+    let mut case = setup(|context: &SetupContext| {
+        std::fs::write(
+            context.join_project_path("pyproject.toml").as_std_path(),
+            r#"
+            [project]
+            name = "test"
+            "#,
+        )?;
+
+        std::fs::write(
+            context.join_project_path("foo.py").as_std_path(),
+            "a = 10 / 0",
+        )?;
+
+        let config_directory = context.join_root_path("home/.config");
+        std::fs::create_dir_all(config_directory.join("knot").as_std_path())?;
+        std::fs::write(
+            config_directory.join("knot/knot.toml").as_std_path(),
+            r#"
+            [rules]
+            division-by-zero = "ignore"
+            "#,
+        )?;
+
+        _config_dir_override = Some(
+            context
+                .system()
+                .with_user_config_directory(Some(config_directory)),
+        );
+
+        Ok(())
+    })?;
+
+    let foo = case
+        .system_file(case.project_path("foo.py"))
+        .expect("foo.py to exist");
+    let diagnostics = case
+        .db()
+        .check_file(foo)
+        .context("Failed to check project.")?;
+
+    assert!(
+        diagnostics.is_empty(),
+        "Expected no diagnostics but got: {diagnostics:#?}"
+    );
+
+    // Enable division-by-zero in the user configuration with warning severity
+    update_file(
+        case.root_path().join("home/.config/knot/knot.toml"),
+        r#"
+        [rules]
+        division-by-zero = "warn"
+        "#,
+    )?;
+
+    let changes = case.stop_watch(event_for_file("knot.toml"));
+
+    case.apply_changes(changes);
+
+    let diagnostics = case
+        .db()
+        .check_file(foo)
+        .context("Failed to check project.")?;
+
+    assert!(
+        diagnostics.len() == 1,
+        "Expected exactly one diagnostic but got: {diagnostics:#?}"
+    );
 
     Ok(())
 }

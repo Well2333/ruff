@@ -20,6 +20,10 @@ use super::helpers::is_empty_or_null_string;
 /// A `pytest.warns` context manager should only contain a single
 /// simple statement that triggers the expected warning.
 ///
+/// In [preview], this rule allows `pytest.warns` bodies to contain `for`
+/// loops with empty bodies (e.g., `pass` or `...` statements), to test
+/// iterator behavior.
+///
 /// ## Example
 /// ```python
 /// import pytest
@@ -38,12 +42,14 @@ use super::helpers::is_empty_or_null_string;
 ///
 /// def test_foo_warns():
 ///     setup()
-///     with pytest.warning(Warning):
+///     with pytest.warns(Warning):
 ///         foo()
 /// ```
 ///
 /// ## References
 /// - [`pytest` documentation: `pytest.warns`](https://docs.pytest.org/en/latest/reference/reference.html#pytest-warns)
+///
+/// [preview]: https://docs.astral.sh/ruff/preview/
 #[derive(ViolationMetadata)]
 pub(crate) struct PytestWarnsWithMultipleStatements;
 
@@ -165,11 +171,11 @@ const fn is_non_trivial_with_body(body: &[Stmt]) -> bool {
 }
 
 /// PT029, PT030
-pub(crate) fn warns_call(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn warns_call(checker: &Checker, call: &ast::ExprCall) {
     if is_pytest_warns(&call.func, checker.semantic()) {
         if checker.enabled(Rule::PytestWarnsWithoutWarning) {
             if call.arguments.is_empty() {
-                checker.diagnostics.push(Diagnostic::new(
+                checker.report_diagnostic(Diagnostic::new(
                     PytestWarnsWithoutWarning,
                     call.func.range(),
                 ));
@@ -191,7 +197,7 @@ pub(crate) fn warns_call(checker: &mut Checker, call: &ast::ExprCall) {
 }
 
 /// PT031
-pub(crate) fn complex_warns(checker: &mut Checker, stmt: &Stmt, items: &[WithItem], body: &[Stmt]) {
+pub(crate) fn complex_warns(checker: &Checker, stmt: &Stmt, items: &[WithItem], body: &[Stmt]) {
     let warns_called = items.iter().any(|item| match &item.context_expr {
         Expr::Call(ast::ExprCall { func, .. }) => is_pytest_warns(func, checker.semantic()),
         _ => false,
@@ -200,10 +206,18 @@ pub(crate) fn complex_warns(checker: &mut Checker, stmt: &Stmt, items: &[WithIte
     // Check body for `pytest.warns` context manager
     if warns_called {
         let is_too_complex = if let [stmt] = body {
+            let in_preview = checker.settings.preview.is_enabled();
+
             match stmt {
                 Stmt::With(ast::StmtWith { body, .. }) => is_non_trivial_with_body(body),
-                // Allow function and class definitions to test decorators
+                // Allow function and class definitions to test decorators.
                 Stmt::ClassDef(_) | Stmt::FunctionDef(_) => false,
+                // Allow empty `for` loops to test iterators.
+                Stmt::For(ast::StmtFor { body, .. }) if in_preview => match &body[..] {
+                    [Stmt::Pass(_)] => false,
+                    [Stmt::Expr(ast::StmtExpr { value, .. })] => !value.is_ellipsis_literal_expr(),
+                    _ => true,
+                },
                 stmt => is_compound_statement(stmt),
             }
         } else {
@@ -211,7 +225,7 @@ pub(crate) fn complex_warns(checker: &mut Checker, stmt: &Stmt, items: &[WithIte
         };
 
         if is_too_complex {
-            checker.diagnostics.push(Diagnostic::new(
+            checker.report_diagnostic(Diagnostic::new(
                 PytestWarnsWithMultipleStatements,
                 stmt.range(),
             ));
@@ -220,7 +234,7 @@ pub(crate) fn complex_warns(checker: &mut Checker, stmt: &Stmt, items: &[WithIte
 }
 
 /// PT030
-fn warning_needs_match(checker: &mut Checker, warning: &Expr) {
+fn warning_needs_match(checker: &Checker, warning: &Expr) {
     if let Some(qualified_name) =
         checker
             .semantic()
@@ -242,7 +256,7 @@ fn warning_needs_match(checker: &mut Checker, warning: &Expr) {
                     .then_some(qualified_name)
             })
     {
-        checker.diagnostics.push(Diagnostic::new(
+        checker.report_diagnostic(Diagnostic::new(
             PytestWarnsTooBroad {
                 warning: qualified_name,
             },

@@ -3,9 +3,9 @@
 #![cfg(not(target_family = "wasm"))]
 
 use regex::escape;
-use std::fs;
 use std::process::Command;
 use std::str;
+use std::{fs, path::Path};
 
 use anyhow::Result;
 use assert_fs::fixture::{ChildPath, FileTouch, PathChild};
@@ -15,8 +15,8 @@ use tempfile::TempDir;
 const BIN_NAME: &str = "ruff";
 const STDIN_BASE_OPTIONS: &[&str] = &["check", "--no-cache", "--output-format", "concise"];
 
-fn tempdir_filter(tempdir: &TempDir) -> String {
-    format!(r"{}\\?/?", escape(tempdir.path().to_str().unwrap()))
+fn tempdir_filter(path: impl AsRef<Path>) -> String {
+    format!(r"{}\\?/?", escape(path.as_ref().to_str().unwrap()))
 }
 
 #[test]
@@ -610,6 +610,139 @@ fn extend_passed_via_config_argument() {
 }
 
 #[test]
+fn nonexistent_extend_file() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let project_dir = tempdir.path().canonicalize()?;
+    fs::write(
+        project_dir.join("ruff.toml"),
+        r#"
+extend = "ruff2.toml"
+"#,
+    )?;
+
+    fs::write(
+        project_dir.join("ruff2.toml"),
+        r#"
+extend = "ruff3.toml"
+"#,
+    )?;
+
+    insta::with_settings!({
+        filters => vec![
+            (tempdir_filter(&project_dir).as_str(), "[TMP]/"),
+            ("The system cannot find the file specified.", "No such file or directory")
+        ]
+    }, {
+        assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(["check"]).current_dir(project_dir), @r"
+        success: false
+        exit_code: 2
+        ----- stdout -----
+
+        ----- stderr -----
+        ruff failed
+          Cause: Failed to load extended configuration `[TMP]/ruff3.toml` (`[TMP]/ruff.toml` extends `[TMP]/ruff2.toml` extends `[TMP]/ruff3.toml`)
+          Cause: Failed to read [TMP]/ruff3.toml
+          Cause: No such file or directory (os error 2)
+        ");
+    });
+
+    Ok(())
+}
+
+#[test]
+fn circular_extend() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let project_path = tempdir.path().canonicalize()?;
+
+    fs::write(
+        project_path.join("ruff.toml"),
+        r#"
+extend = "ruff2.toml"
+"#,
+    )?;
+    fs::write(
+        project_path.join("ruff2.toml"),
+        r#"
+extend = "ruff3.toml"
+"#,
+    )?;
+    fs::write(
+        project_path.join("ruff3.toml"),
+        r#"
+extend = "ruff.toml"
+"#,
+    )?;
+
+    insta::with_settings!({
+        filters => vec![(tempdir_filter(&project_path).as_str(), "[TMP]/")]
+    }, {
+    assert_cmd_snapshot!(
+        Command::new(get_cargo_bin(BIN_NAME))
+            .args(["check"])
+            .current_dir(project_path),
+        @r"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    ruff failed
+      Cause: Circular configuration detected: `[TMP]/ruff.toml` extends `[TMP]/ruff2.toml` extends `[TMP]/ruff3.toml` extends `[TMP]/ruff.toml`
+    ");
+    });
+
+    Ok(())
+}
+
+#[test]
+fn parse_error_extends() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let project_path = tempdir.path().canonicalize()?;
+
+    fs::write(
+        project_path.join("ruff.toml"),
+        r#"
+extend = "ruff2.toml"
+"#,
+    )?;
+    fs::write(
+        project_path.join("ruff2.toml"),
+        r#"
+[lint]
+select = [E501]
+"#,
+    )?;
+
+    insta::with_settings!({
+        filters => vec![(tempdir_filter(&project_path).as_str(), "[TMP]/")]
+    }, {
+    assert_cmd_snapshot!(
+        Command::new(get_cargo_bin(BIN_NAME))
+            .args(["check"])
+            .current_dir(project_path),
+        @r"
+    success: false
+    exit_code: 2
+    ----- stdout -----
+
+    ----- stderr -----
+    ruff failed
+      Cause: Failed to load extended configuration `[TMP]/ruff2.toml` (`[TMP]/ruff.toml` extends `[TMP]/ruff2.toml`)
+      Cause: Failed to parse [TMP]/ruff2.toml
+      Cause: TOML parse error at line 3, column 11
+      |
+    3 | select = [E501]
+      |           ^
+    invalid array
+    expected `]`
+    ");
+    });
+
+    Ok(())
+}
+
+#[test]
 fn config_file_and_isolated() -> Result<()> {
     let tempdir = TempDir::new()?;
     let ruff_dot_toml = tempdir.path().join("ruff.toml");
@@ -1019,6 +1152,22 @@ include = ["*.ipy"]
     });
 
     Ok(())
+}
+
+#[test]
+fn warn_invalid_noqa_with_no_diagnostics() {
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .args(["--isolated"])
+        .arg("--select")
+        .arg("F401")
+        .arg("-")
+        .pass_stdin(
+            r#"
+# ruff: noqa: AAA101
+print("Hello world!")
+"#
+        ));
 }
 
 #[test]
@@ -2079,6 +2228,7 @@ fn flake8_import_convention_invalid_aliases_config_alias_name() -> Result<()> {
 
         ----- stderr -----
         ruff failed
+          Cause: Failed to load configuration `[TMP]/ruff.toml`
           Cause: Failed to parse [TMP]/ruff.toml
           Cause: TOML parse error at line 3, column 17
           |
@@ -2115,6 +2265,7 @@ fn flake8_import_convention_invalid_aliases_config_extend_alias_name() -> Result
 
         ----- stderr -----
         ruff failed
+          Cause: Failed to load configuration `[TMP]/ruff.toml`
           Cause: Failed to parse [TMP]/ruff.toml
           Cause: TOML parse error at line 3, column 17
           |
@@ -2151,6 +2302,7 @@ fn flake8_import_convention_invalid_aliases_config_module_name() -> Result<()> {
 
         ----- stderr -----
         ruff failed
+          Cause: Failed to load configuration `[TMP]/ruff.toml`
           Cause: Failed to parse [TMP]/ruff.toml
           Cause: TOML parse error at line 3, column 1
           |
@@ -2159,4 +2311,319 @@ fn flake8_import_convention_invalid_aliases_config_module_name() -> Result<()> {
         invalid value: string "module..invalid", expected a sequence of Python identifiers delimited by periods
         "#);});
     Ok(())
+}
+
+#[test]
+fn flake8_import_convention_unused_aliased_import() {
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .arg("--config")
+        .arg(r#"lint.isort.required-imports = ["import pandas"]"#)
+        .args(["--select", "I002,ICN001,F401"])
+        .args(["--stdin-filename", "test.py"])
+        .arg("--unsafe-fixes")
+        .arg("--fix")
+        .arg("-")
+        .pass_stdin("1"));
+}
+
+#[test]
+fn flake8_import_convention_unused_aliased_import_no_conflict() {
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .arg("--config")
+        .arg(r#"lint.isort.required-imports = ["import pandas as pd"]"#)
+        .args(["--select", "I002,ICN001,F401"])
+        .args(["--stdin-filename", "test.py"])
+        .arg("--unsafe-fixes")
+        .arg("--fix")
+        .arg("-")
+        .pass_stdin("1"));
+}
+
+/// Test that private, old-style `TypeVar` generics
+/// 1. Get replaced with PEP 695 type parameters (UP046, UP047)
+/// 2. Get renamed to remove leading underscores (UP049)
+/// 3. Emit a warning that the standalone type variable is now unused (PYI018)
+/// 4. Remove the now-unused `Generic` import
+#[test]
+fn pep695_generic_rename() {
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .args(["--select", "F401,PYI018,UP046,UP047,UP049"])
+        .args(["--stdin-filename", "test.py"])
+        .arg("--unsafe-fixes")
+        .arg("--fix")
+        .arg("--preview")
+        .arg("--target-version=py312")
+        .arg("-")
+        .pass_stdin(
+            r#"
+from typing import Generic, TypeVar
+_T = TypeVar("_T")
+
+class OldStyle(Generic[_T]):
+    var: _T
+
+def func(t: _T) -> _T:
+    x: _T
+    return x
+"#
+        ),
+        @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+
+
+    class OldStyle[T]:
+        var: T
+
+    def func[T](t: T) -> T:
+        x: T
+        return x
+
+    ----- stderr -----
+    Found 7 errors (7 fixed, 0 remaining).
+    "
+    );
+}
+
+/// Test that we do not rename two different type parameters to the same name
+/// in one execution of Ruff (autofixing this to `class Foo[T, T]: ...` would
+/// introduce invalid syntax)
+#[test]
+fn type_parameter_rename_isolation() {
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .args(["--select", "UP049"])
+        .args(["--stdin-filename", "test.py"])
+        .arg("--unsafe-fixes")
+        .arg("--fix")
+        .arg("--preview")
+        .arg("--target-version=py312")
+        .arg("-")
+        .pass_stdin(
+            r#"
+class Foo[_T, __T]:
+    pass
+"#
+        ),
+        @r"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+
+    class Foo[T, __T]:
+        pass
+
+    ----- stderr -----
+    test.py:2:14: UP049 Generic class uses private type parameters
+    Found 2 errors (1 fixed, 1 remaining).
+    "
+    );
+}
+
+/// construct a directory tree with this structure:
+/// .
+/// ├── abc
+/// │   └── __init__.py
+/// ├── collections
+/// │   ├── __init__.py
+/// │   ├── abc
+/// │   │   └── __init__.py
+/// │   └── foobar
+/// │       └── __init__.py
+/// ├── foobar
+/// │   ├── __init__.py
+/// │   ├── abc
+/// │   │   └── __init__.py
+/// │   └── collections
+/// │       ├── __init__.py
+/// │       ├── abc
+/// │       │   └── __init__.py
+/// │       └── foobar
+/// │           └── __init__.py
+/// ├── ruff.toml
+/// └── urlparse
+///     └── __init__.py
+fn create_a005_module_structure(tempdir: &TempDir) -> Result<()> {
+    fn create_module(path: &Path) -> Result<()> {
+        fs::create_dir(path)?;
+        fs::File::create(path.join("__init__.py"))?;
+        Ok(())
+    }
+
+    let foobar = tempdir.path().join("foobar");
+    create_module(&foobar)?;
+    for base in [&tempdir.path().into(), &foobar] {
+        for dir in ["abc", "collections"] {
+            create_module(&base.join(dir))?;
+        }
+        create_module(&base.join("collections").join("abc"))?;
+        create_module(&base.join("collections").join("foobar"))?;
+    }
+    create_module(&tempdir.path().join("urlparse"))?;
+    // also create a ruff.toml to mark the project root
+    fs::File::create(tempdir.path().join("ruff.toml"))?;
+
+    Ok(())
+}
+
+/// Test A005 with `builtins-strict-checking = true`
+#[test]
+fn a005_module_shadowing_strict() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    create_a005_module_structure(&tempdir)?;
+
+    insta::with_settings!({
+        filters => vec![(r"\\", "/")]
+    }, {
+        assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+            .args(STDIN_BASE_OPTIONS)
+            .arg("--config")
+            .arg(r#"lint.flake8-builtins.builtins-strict-checking = true"#)
+            .args(["--select", "A005"])
+            .current_dir(tempdir.path()),
+            @r"
+        success: false
+        exit_code: 1
+        ----- stdout -----
+        abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        collections/__init__.py:1:1: A005 Module `collections` shadows a Python standard-library module
+        collections/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        foobar/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        foobar/collections/__init__.py:1:1: A005 Module `collections` shadows a Python standard-library module
+        foobar/collections/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        Found 6 errors.
+
+        ----- stderr -----
+        ");
+    });
+
+    Ok(())
+}
+
+/// Test A005 with `builtins-strict-checking = false`
+#[test]
+fn a005_module_shadowing_non_strict() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    create_a005_module_structure(&tempdir)?;
+
+    insta::with_settings!({
+        filters => vec![(r"\\", "/")]
+    }, {
+        assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+            .args(STDIN_BASE_OPTIONS)
+            .arg("--config")
+            .arg(r#"lint.flake8-builtins.builtins-strict-checking = false"#)
+            .args(["--select", "A005"])
+            .current_dir(tempdir.path()),
+            @r"
+        success: false
+        exit_code: 1
+        ----- stdout -----
+        abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        collections/__init__.py:1:1: A005 Module `collections` shadows a Python standard-library module
+        Found 2 errors.
+
+        ----- stderr -----
+        ");
+
+    });
+
+    Ok(())
+}
+
+/// Test A005 with `builtins-strict-checking` unset
+/// TODO(brent) This should currently match the strict version, but after the next minor
+/// release it will match the non-strict version directly above
+#[test]
+fn a005_module_shadowing_strict_default() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    create_a005_module_structure(&tempdir)?;
+
+    insta::with_settings!({
+        filters => vec![(r"\\", "/")]
+    }, {
+        assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+            .args(STDIN_BASE_OPTIONS)
+            .args(["--select", "A005"])
+            .current_dir(tempdir.path()),
+            @r"
+        success: false
+        exit_code: 1
+        ----- stdout -----
+        abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        collections/__init__.py:1:1: A005 Module `collections` shadows a Python standard-library module
+        collections/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        foobar/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        foobar/collections/__init__.py:1:1: A005 Module `collections` shadows a Python standard-library module
+        foobar/collections/abc/__init__.py:1:1: A005 Module `abc` shadows a Python standard-library module
+        Found 6 errors.
+
+        ----- stderr -----
+        ");
+    });
+    Ok(())
+}
+
+/// Test that the linter respects per-file-target-version.
+#[test]
+fn per_file_target_version_linter() {
+    // without per-file-target-version, there should be one UP046 error
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .args(["--target-version", "py312"])
+        .args(["--select", "UP046"]) // only triggers on 3.12+
+        .args(["--stdin-filename", "test.py"])
+        .arg("--preview")
+        .arg("-")
+        .pass_stdin(r#"
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class A(Generic[T]):
+    var: T
+"#),
+        @r"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    test.py:6:9: UP046 Generic class `A` uses `Generic` subclass instead of type parameters
+    Found 1 error.
+    No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).
+
+    ----- stderr -----
+    "
+    );
+
+    // with per-file-target-version, there should be no errors because the new generic syntax is
+    // unavailable
+    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
+        .args(STDIN_BASE_OPTIONS)
+        .args(["--target-version", "py312"])
+        .args(["--config", r#"per-file-target-version = {"test.py" = "py311"}"#])
+        .args(["--select", "UP046"]) // only triggers on 3.12+
+        .args(["--stdin-filename", "test.py"])
+        .arg("--preview")
+        .arg("-")
+        .pass_stdin(r#"
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+class A(Generic[T]):
+    var: T
+"#),
+        @r"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    All checks passed!
+
+    ----- stderr -----
+    "
+    );
 }

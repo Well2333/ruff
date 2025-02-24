@@ -3,7 +3,7 @@
 
 #![no_main]
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use libfuzzer_sys::{fuzz_target, Corpus};
 
@@ -11,13 +11,14 @@ use red_knot_python_semantic::lint::LintRegistry;
 use red_knot_python_semantic::types::check_types;
 use red_knot_python_semantic::{
     default_lint_registry, lint::RuleSelection, Db as SemanticDb, Program, ProgramSettings,
-    PythonPlatform, PythonVersion, SearchPathSettings,
+    PythonPlatform, SearchPathSettings,
 };
 use ruff_db::files::{system_path_to_file, File, Files};
 use ruff_db::system::{DbWithTestSystem, System, SystemPathBuf, TestSystem};
 use ruff_db::vendored::VendoredFileSystem;
 use ruff_db::{Db as SourceDb, Upcast};
-use ruff_python_parser::{parse_unchecked, Mode};
+use ruff_python_ast::PythonVersion;
+use ruff_python_parser::{parse_unchecked, Mode, ParseOptions};
 
 /// Database that can be used for testing.
 ///
@@ -29,8 +30,8 @@ struct TestDb {
     files: Files,
     system: TestSystem,
     vendored: VendoredFileSystem,
-    events: std::sync::Arc<Mutex<Vec<salsa::Event>>>,
-    rule_selection: std::sync::Arc<RuleSelection>,
+    events: Arc<Mutex<Vec<salsa::Event>>>,
+    rule_selection: Arc<RuleSelection>,
 }
 
 impl TestDb {
@@ -39,7 +40,7 @@ impl TestDb {
             storage: salsa::Storage::default(),
             system: TestSystem::default(),
             vendored: red_knot_vendored::file_system().clone(),
-            events: std::sync::Arc::default(),
+            events: Arc::default(),
             files: Files::default(),
             rule_selection: RuleSelection::from_registry(default_lint_registry()).into(),
         }
@@ -86,8 +87,8 @@ impl SemanticDb for TestDb {
         !file.path(self).is_vendored_path()
     }
 
-    fn rule_selection(&self) -> &RuleSelection {
-        &self.rule_selection
+    fn rule_selection(&self) -> Arc<RuleSelection> {
+        self.rule_selection.clone()
     }
 
     fn lint_registry(&self) -> &LintRegistry {
@@ -118,7 +119,7 @@ fn setup_db() -> TestDb {
         ProgramSettings {
             python_version: PythonVersion::default(),
             python_platform: PythonPlatform::default(),
-            search_paths: SearchPathSettings::new(src_root),
+            search_paths: SearchPathSettings::new(vec![src_root]),
         },
     )
     .expect("Valid search path settings");
@@ -133,7 +134,7 @@ fn do_fuzz(case: &[u8]) -> Corpus {
         return Corpus::Reject;
     };
 
-    let parsed = parse_unchecked(code, Mode::Module);
+    let parsed = parse_unchecked(code, ParseOptions::from(Mode::Module));
     if parsed.is_valid() {
         return Corpus::Reject;
     }

@@ -1,5 +1,5 @@
 //! Rules from [Pylint](https://pypi.org/project/pylint/).
-mod helpers;
+pub(crate) mod helpers;
 pub(crate) mod rules;
 pub mod settings;
 
@@ -9,13 +9,14 @@ mod tests {
 
     use anyhow::Result;
     use regex::Regex;
+    use ruff_python_ast::PythonVersion;
     use rustc_hash::FxHashSet;
     use test_case::test_case;
 
     use crate::registry::Rule;
-    use crate::rules::pylint;
+    use crate::rules::{flake8_tidy_imports, pylint};
 
-    use crate::settings::types::{PreviewMode, PythonVersion};
+    use crate::settings::types::PreviewMode;
     use crate::settings::LinterSettings;
     use crate::test::test_path;
     use crate::{assert_messages, settings};
@@ -118,6 +119,10 @@ mod tests {
         Path::new("named_expr_without_context.py")
     )]
     #[test_case(Rule::NonlocalAndGlobal, Path::new("nonlocal_and_global.py"))]
+    #[test_case(
+        Rule::RedefinedSlotsInSubclass,
+        Path::new("redefined_slots_in_subclass.py")
+    )]
     #[test_case(Rule::NonlocalWithoutBinding, Path::new("nonlocal_without_binding.py"))]
     #[test_case(Rule::NonSlotAssignment, Path::new("non_slot_assignment.py"))]
     #[test_case(Rule::PropertyWithParameters, Path::new("property_with_parameters.py"))]
@@ -245,7 +250,7 @@ mod tests {
         let diagnostics = test_path(
             Path::new("pylint/continue_in_finally.py"),
             &LinterSettings::for_rule(Rule::ContinueInFinally)
-                .with_target_version(PythonVersion::Py37),
+                .with_target_version(PythonVersion::PY37),
         )?;
         assert_messages!(diagnostics);
         Ok(())
@@ -408,11 +413,40 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn import_outside_top_level_with_banned() -> Result<()> {
+        let diagnostics = test_path(
+            Path::new("pylint/import_outside_top_level_with_banned.py"),
+            &LinterSettings {
+                preview: PreviewMode::Enabled,
+                flake8_tidy_imports: flake8_tidy_imports::settings::Settings {
+                    banned_module_level_imports: vec![
+                        "foo_banned".to_string(),
+                        "pkg_banned".to_string(),
+                        "pkg.bar_banned".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ..LinterSettings::for_rules(vec![
+                    Rule::BannedModuleLevelImports,
+                    Rule::ImportOutsideTopLevel,
+                ])
+            },
+        )?;
+        assert_messages!(diagnostics);
+        Ok(())
+    }
+
     #[test_case(
         Rule::RepeatedEqualityComparison,
         Path::new("repeated_equality_comparison.py")
     )]
     #[test_case(Rule::InvalidEnvvarDefault, Path::new("invalid_envvar_default.py"))]
+    #[test_case(Rule::BadStrStripCall, Path::new("bad_str_strip_call.py"))]
+    #[test_case(
+        Rule::BadStaticmethodArgument,
+        Path::new("bad_staticmethod_argument.py")
+    )]
     fn preview_rules(rule_code: Rule, path: &Path) -> Result<()> {
         let snapshot = format!(
             "preview__{}_{}",
