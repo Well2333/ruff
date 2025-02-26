@@ -226,6 +226,33 @@ SIM108.py:167:1: SIM108 [*] Use ternary operator `z = 1 if True else other` inst
 172 169 | if False:
 173 170 |     z = 1
 
+SIM108.py:172:1: SIM108 [*] Use ternary operator `z = 1 if False else other` instead of `if`-`else`-block
+    |
+170 |       z = other
+171 |
+172 | / if False:
+173 | |     z = 1
+174 | | else:
+175 | |     z = other
+    | |_____________^ SIM108
+176 |
+177 |   if 1:
+    |
+    = help: Replace `if`-`else`-block with `z = 1 if False else other`
+
+ℹ Unsafe fix
+169 169 | else:
+170 170 |     z = other
+171 171 | 
+172     |-if False:
+173     |-    z = 1
+174     |-else:
+175     |-    z = other
+    172 |+z = 1 if False else other
+176 173 | 
+177 174 | if 1:
+178 175 |     z = True
+
 SIM108.py:177:1: SIM108 [*] Use ternary operator `z = True if 1 else other` instead of `if`-`else`-block
     |
 175 |       z = other
@@ -301,3 +328,55 @@ SIM108.py:193:1: SIM108 [*] Use ternary operator `z = not foo() if foo() else ot
 195     |-else:
 196     |-    z = other
     193 |+z = not foo() if foo() else other
+197 194 | 
+198 195 | 
+199 196 | # These two cases double as tests for f-string quote preservation. The first
+
+SIM108.py:202:1: SIM108 [*] Use ternary operator `var = "str" if cond else f"{first}-{second}"` instead of `if`-`else`-block
+    |
+200 |   # f-string should preserve its double quotes, and the second should preserve
+201 |   # single quotes
+202 | / if cond:
+203 | |     var = "str"
+204 | | else:
+205 | |     var = f"{first}-{second}"
+    | |_____________________________^ SIM108
+206 |
+207 |   if cond:
+    |
+    = help: Replace `if`-`else`-block with `var = "str" if cond else f"{first}-{second}"`
+
+ℹ Unsafe fix
+199 199 | # These two cases double as tests for f-string quote preservation. The first
+200 200 | # f-string should preserve its double quotes, and the second should preserve
+201 201 | # single quotes
+202     |-if cond:
+203     |-    var = "str"
+204     |-else:
+205     |-    var = f"{first}-{second}"
+    202 |+var = "str" if cond else f"{first}-{second}"
+206 203 | 
+207 204 | if cond:
+208 205 |     var = "str"
+
+SIM108.py:207:1: SIM108 [*] Use ternary operator `var = "str" if cond else f'{first}-{second}'` instead of `if`-`else`-block
+    |
+205 |       var = f"{first}-{second}"
+206 |
+207 | / if cond:
+208 | |     var = "str"
+209 | | else:
+210 | |     var = f'{first}-{second}'
+    | |_____________________________^ SIM108
+    |
+    = help: Replace `if`-`else`-block with `var = "str" if cond else f'{first}-{second}'`
+
+ℹ Unsafe fix
+204 204 | else:
+205 205 |     var = f"{first}-{second}"
+206 206 | 
+207     |-if cond:
+208     |-    var = "str"
+209     |-else:
+210     |-    var = f'{first}-{second}'
+    207 |+var = "str" if cond else f'{first}-{second}'

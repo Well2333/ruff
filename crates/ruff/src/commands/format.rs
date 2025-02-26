@@ -341,7 +341,7 @@ pub(crate) fn format_source(
 ) -> Result<FormattedSource, FormatCommandError> {
     match &source_kind {
         SourceKind::Python(unformatted) => {
-            let options = settings.to_format_options(source_type, unformatted);
+            let options = settings.to_format_options(source_type, unformatted, path);
 
             let formatted = if let Some(range) = range {
                 let line_index = LineIndex::from_source_text(unformatted);
@@ -391,7 +391,7 @@ pub(crate) fn format_source(
                 ));
             }
 
-            let options = settings.to_format_options(source_type, notebook.source_code());
+            let options = settings.to_format_options(source_type, notebook.source_code(), path);
 
             let mut output: Option<String> = None;
             let mut last: Option<TextSize> = None;
@@ -893,7 +893,7 @@ pub(super) fn warn_incompatible_formatter_settings(resolver: &Resolver) {
                 QuoteStyle::Single | QuoteStyle::Double
             )
         {
-            warn_user_once!("The `flake8-quotes.multiline-quotes=\"single\"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `\"double\"`.`");
+            warn_user_once!("The `flake8-quotes.docstring-quotes=\"single\"` option is incompatible with the formatter. We recommend disabling `Q002` when using the formatter, which enforces double quotes for docstrings. Alternatively, set the `flake8-quotes.docstring-quotes` option to `\"double\"`.`");
         }
 
         // Validate all isort settings.

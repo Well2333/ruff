@@ -9,7 +9,8 @@
 //! ```
 
 use anyhow::Context;
-use red_knot_python_semantic::{PythonPlatform, PythonVersion};
+use red_knot_python_semantic::PythonPlatform;
+use ruff_python_ast::PythonVersion;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -34,6 +35,12 @@ impl MarkdownTestConfig {
             .as_ref()
             .and_then(|env| env.python_platform.clone())
     }
+
+    pub(crate) fn typeshed(&self) -> Option<&str> {
+        self.environment
+            .as_ref()
+            .and_then(|env| env.typeshed.as_deref())
+    }
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -44,6 +51,9 @@ pub(crate) struct Environment {
 
     /// Target platform to assume when resolving types.
     pub(crate) python_platform: Option<PythonPlatform>,
+
+    /// Path to a custom typeshed directory.
+    pub(crate) typeshed: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

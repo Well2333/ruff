@@ -10,8 +10,7 @@ use ruff_text_size::Ranged;
 use crate::checkers::ast::Checker;
 use crate::registry::Rule;
 use crate::rules::flake8_type_checking::helpers::quote_type_expression;
-use crate::settings::types::PythonVersion;
-use crate::settings::LinterSettings;
+use ruff_python_ast::PythonVersion;
 
 /// ## What it does
 /// Checks if [PEP 613] explicit type aliases contain references to
@@ -113,9 +112,9 @@ impl Violation for UnquotedTypeAlias {
 /// This rule only applies to type aliases in non-stub files. For removing quotes in other
 /// contexts or in stub files, see:
 ///
-/// - [`quoted-annotation-in-stub`](quoted-annotation-in-stub.md): A rule that
+/// - [`quoted-annotation-in-stub`][PYI020]: A rule that
 ///   removes all quoted annotations from stub files
-/// - [`quoted-annotation`](quoted-annotation.md): A rule that removes unnecessary quotes
+/// - [`quoted-annotation`][UP037]: A rule that removes unnecessary quotes
 ///   from *annotations* in runtime files.
 ///
 /// ## References
@@ -126,6 +125,8 @@ impl Violation for UnquotedTypeAlias {
 /// [PEP 604]: https://peps.python.org/pep-0604/
 /// [PEP 613]: https://peps.python.org/pep-0613/
 /// [PEP 695]: https://peps.python.org/pep-0695/#generic-type-alias
+/// [PYI020]: https://docs.astral.sh/ruff/rules/quoted-annotation-in-stub/
+/// [UP037]: https://docs.astral.sh/ruff/rules/quoted-annotation/
 #[derive(ViolationMetadata)]
 pub(crate) struct QuotedTypeAlias;
 
@@ -175,6 +176,7 @@ pub(crate) fn unquoted_type_alias(checker: &Checker, binding: &Binding) -> Optio
         checker.semantic(),
         checker.stylist(),
         checker.locator(),
+        checker.default_string_flags(),
     );
     let mut diagnostics = Vec::with_capacity(names.len());
     for name in names {
@@ -264,7 +266,7 @@ fn collect_typing_references<'a>(
 
 /// TC008
 pub(crate) fn quoted_type_alias(
-    checker: &mut Checker,
+    checker: &Checker,
     expr: &Expr,
     annotation_expr: &ast::ExprStringLiteral,
 ) {
@@ -281,7 +283,7 @@ pub(crate) fn quoted_type_alias(
 
     // explicit type aliases require some additional checks to avoid false positives
     if checker.semantic().in_annotated_type_alias_value()
-        && quotes_are_unremovable(checker.semantic(), expr, checker.settings)
+        && quotes_are_unremovable(checker.semantic(), expr, checker.target_version())
     {
         return;
     }
@@ -289,15 +291,12 @@ pub(crate) fn quoted_type_alias(
     let range = annotation_expr.range();
     let mut diagnostic = Diagnostic::new(QuotedTypeAlias, range);
     let edit = Edit::range_replacement(annotation_expr.value.to_string(), range);
-    if checker
-        .comment_ranges()
-        .has_comments(expr, checker.source())
-    {
+    if checker.comment_ranges().intersects(range) {
         diagnostic.set_fix(Fix::unsafe_edit(edit));
     } else {
         diagnostic.set_fix(Fix::safe_edit(edit));
     }
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }
 
 /// Traverses the type expression and checks if the expression can safely
@@ -305,7 +304,7 @@ pub(crate) fn quoted_type_alias(
 fn quotes_are_unremovable(
     semantic: &SemanticModel,
     expr: &Expr,
-    settings: &LinterSettings,
+    target_version: PythonVersion,
 ) -> bool {
     match expr {
         Expr::BinOp(ast::ExprBinOp {
@@ -313,11 +312,11 @@ fn quotes_are_unremovable(
         }) => {
             match op {
                 Operator::BitOr => {
-                    if settings.target_version < PythonVersion::Py310 {
+                    if target_version < PythonVersion::PY310 {
                         return true;
                     }
-                    quotes_are_unremovable(semantic, left, settings)
-                        || quotes_are_unremovable(semantic, right, settings)
+                    quotes_are_unremovable(semantic, left, target_version)
+                        || quotes_are_unremovable(semantic, right, target_version)
                 }
                 // for now we'll treat uses of other operators as unremovable quotes
                 // since that would make it an invalid type expression anyways. We skip
@@ -330,7 +329,7 @@ fn quotes_are_unremovable(
             value,
             ctx: ExprContext::Load,
             ..
-        }) => quotes_are_unremovable(semantic, value, settings),
+        }) => quotes_are_unremovable(semantic, value, target_version),
         Expr::Subscript(ast::ExprSubscript { value, slice, .. }) => {
             // for subscripts we don't know whether it's safe to do at runtime
             // since the operation may only be available at type checking time.
@@ -338,7 +337,7 @@ fn quotes_are_unremovable(
             if !semantic.in_type_checking_block() {
                 return true;
             }
-            if quotes_are_unremovable(semantic, value, settings) {
+            if quotes_are_unremovable(semantic, value, target_version) {
                 return true;
             }
             // for `typing.Annotated`, only analyze the first argument, since the rest may
@@ -347,23 +346,23 @@ fn quotes_are_unremovable(
                 if semantic.match_typing_qualified_name(&qualified_name, "Annotated") {
                     if let Expr::Tuple(ast::ExprTuple { elts, .. }) = slice.as_ref() {
                         return !elts.is_empty()
-                            && quotes_are_unremovable(semantic, &elts[0], settings);
+                            && quotes_are_unremovable(semantic, &elts[0], target_version);
                     }
                     return false;
                 }
             }
-            quotes_are_unremovable(semantic, slice, settings)
+            quotes_are_unremovable(semantic, slice, target_version)
         }
         Expr::Attribute(ast::ExprAttribute { value, .. }) => {
             // for attributes we also don't know whether it's safe
             if !semantic.in_type_checking_block() {
                 return true;
             }
-            quotes_are_unremovable(semantic, value, settings)
+            quotes_are_unremovable(semantic, value, target_version)
         }
         Expr::List(ast::ExprList { elts, .. }) | Expr::Tuple(ast::ExprTuple { elts, .. }) => {
             for elt in elts {
-                if quotes_are_unremovable(semantic, elt, settings) {
+                if quotes_are_unremovable(semantic, elt, target_version) {
                     return true;
                 }
             }

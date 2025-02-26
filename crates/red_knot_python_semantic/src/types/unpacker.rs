@@ -43,7 +43,7 @@ impl<'db> Unpacker<'db> {
         );
 
         let mut value_ty = infer_expression_types(self.db(), value.expression())
-            .expression_ty(value.scoped_expression_id(self.db(), self.scope));
+            .expression_type(value.scoped_expression_id(self.db(), self.scope));
 
         if value.is_assign()
             && self.context.in_stub()
@@ -57,24 +57,28 @@ impl<'db> Unpacker<'db> {
         if value.is_iterable() {
             // If the value is an iterable, then the type that needs to be unpacked is the iterator
             // type.
-            value_ty = value_ty
-                .iterate(self.db())
-                .unwrap_with_diagnostic(&self.context, value.as_any_node_ref(self.db()));
+            value_ty = value_ty.try_iterate(self.db()).unwrap_or_else(|err| {
+                err.report_diagnostic(&self.context, value.as_any_node_ref(self.db()));
+                err.fallback_element_type(self.db())
+            });
         }
 
-        self.unpack_inner(target, value_ty);
+        self.unpack_inner(target, value.as_any_node_ref(self.db()), value_ty);
     }
 
-    fn unpack_inner(&mut self, target: &ast::Expr, value_ty: Type<'db>) {
+    fn unpack_inner(
+        &mut self,
+        target: &ast::Expr,
+        value_expr: AnyNodeRef<'db>,
+        value_ty: Type<'db>,
+    ) {
         match target {
-            ast::Expr::Name(target_name) => {
-                self.targets.insert(
-                    target_name.scoped_expression_id(self.db(), self.scope),
-                    value_ty,
-                );
+            ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
+                self.targets
+                    .insert(target.scoped_expression_id(self.db(), self.scope), value_ty);
             }
             ast::Expr::Starred(ast::ExprStarred { value, .. }) => {
-                self.unpack_inner(value, value_ty);
+                self.unpack_inner(value, value_expr, value_ty);
             }
             ast::Expr::List(ast::ExprList { elts, .. })
             | ast::Expr::Tuple(ast::ExprTuple { elts, .. }) => {
@@ -121,7 +125,7 @@ impl<'db> Unpacker<'db> {
                             Ordering::Less => {
                                 self.context.report_lint(
                                     &INVALID_ASSIGNMENT,
-                                    target.into(),
+                                    target,
                                     format_args!(
                                         "Too many values to unpack (expected {}, got {})",
                                         elts.len(),
@@ -132,7 +136,7 @@ impl<'db> Unpacker<'db> {
                             Ordering::Greater => {
                                 self.context.report_lint(
                                     &INVALID_ASSIGNMENT,
-                                    target.into(),
+                                    target,
                                     format_args!(
                                         "Not enough values to unpack (expected {}, got {})",
                                         elts.len(),
@@ -152,8 +156,10 @@ impl<'db> Unpacker<'db> {
                         let ty = if ty.is_literal_string() {
                             Type::LiteralString
                         } else {
-                            ty.iterate(self.db())
-                                .unwrap_with_diagnostic(&self.context, AnyNodeRef::from(target))
+                            ty.try_iterate(self.db()).unwrap_or_else(|err| {
+                                err.report_diagnostic(&self.context, value_expr);
+                                err.fallback_element_type(self.db())
+                            })
                         };
                         for target_type in &mut target_types {
                             target_type.push(ty);
@@ -167,7 +173,7 @@ impl<'db> Unpacker<'db> {
                         [] => Type::unknown(),
                         types => UnionType::from_elements(self.db(), types),
                     };
-                    self.unpack_inner(element, element_ty);
+                    self.unpack_inner(element, value_expr, element_ty);
                 }
             }
             _ => {}
@@ -229,7 +235,7 @@ impl<'db> Unpacker<'db> {
         } else {
             self.context.report_lint(
                 &INVALID_ASSIGNMENT,
-                expr.into(),
+                expr,
                 format_args!(
                     "Not enough values to unpack (expected {} or more, got {})",
                     targets.len() - 1,
@@ -258,15 +264,21 @@ impl<'db> Unpacker<'db> {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, salsa::Update)]
 pub(crate) struct UnpackResult<'db> {
     targets: FxHashMap<ScopedExpressionId, Type<'db>>,
     diagnostics: TypeCheckDiagnostics,
 }
 
 impl<'db> UnpackResult<'db> {
-    pub(crate) fn get(&self, expr_id: ScopedExpressionId) -> Option<Type<'db>> {
-        self.targets.get(&expr_id).copied()
+    /// Returns the inferred type for a given sub-expression of the left-hand side target
+    /// of an unpacking assignment.
+    ///
+    /// Panics if a scoped expression ID is passed in that does not correspond to a sub-
+    /// expression of the target.
+    #[track_caller]
+    pub(crate) fn expression_type(&self, expr_id: ScopedExpressionId) -> Type<'db> {
+        self.targets[&expr_id]
     }
 }
 

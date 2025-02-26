@@ -76,11 +76,11 @@ with Manager():
 
 ```py
 class Manager:
-    __enter__ = 42
+    __enter__: int = 42
 
     def __exit__(self, exc_tpe, exc_value, traceback): ...
 
-# error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because the method `__enter__` of type `Literal[42]` is not callable"
+# error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because it does not correctly implement `__enter__`"
 with Manager():
     ...
 ```
@@ -88,12 +88,14 @@ with Manager():
 ## Context manager with non-callable `__exit__` attribute
 
 ```py
+from typing_extensions import Self
+
 class Manager:
     def __enter__(self) -> Self: ...
 
-    __exit__ = 32
+    __exit__: int = 32
 
-# error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because the method `__exit__` of type `Literal[32]` is not callable"
+# error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because it does not correctly implement `__exit__`"
 with Manager():
     ...
 ```
@@ -131,4 +133,20 @@ def _(flag: bool):
     # error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because the method `__enter__` is possibly unbound"
     with Manager() as f:
         reveal_type(f)  # revealed: str
+```
+
+## Invalid `__enter__` signature
+
+```py
+class Manager:
+    def __enter__() -> str:
+        return "foo"
+
+    def __exit__(self, exc_type, exc_value, traceback): ...
+
+context_expr = Manager()
+
+# error: [invalid-context-manager] "Object of type `Manager` cannot be used with `with` because it does not correctly implement `__enter__`"
+with context_expr as f:
+    reveal_type(f)  # revealed: str
 ```

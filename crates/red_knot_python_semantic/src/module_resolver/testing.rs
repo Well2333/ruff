@@ -1,10 +1,10 @@
 use ruff_db::system::{DbWithTestSystem, SystemPath, SystemPathBuf};
 use ruff_db::vendored::VendoredPathBuf;
+use ruff_python_ast::PythonVersion;
 
 use crate::db::tests::TestDb;
 use crate::program::{Program, SearchPathSettings};
-use crate::python_version::PythonVersion;
-use crate::{ProgramSettings, PythonPlatform, SitePackages};
+use crate::{ProgramSettings, PythonPath, PythonPlatform};
 
 /// A test case for the module resolver.
 ///
@@ -73,7 +73,7 @@ pub(crate) struct UnspecifiedTypeshed;
 ///
 /// For tests checking that standard-library module resolution is working
 /// correctly, you should usually create a [`MockedTypeshed`] instance
-/// and pass it to the [`TestCaseBuilder::with_custom_typeshed`] method.
+/// and pass it to the [`TestCaseBuilder::with_mocked_typeshed`] method.
 /// If you need to check something that involves the vendored typeshed stubs
 /// we include as part of the binary, you can instead use the
 /// [`TestCaseBuilder::with_vendored_typeshed`] method.
@@ -237,9 +237,9 @@ impl TestCaseBuilder<MockedTypeshed> {
                 python_platform,
                 search_paths: SearchPathSettings {
                     extra_paths: vec![],
-                    src_root: src.clone(),
-                    typeshed: Some(typeshed.clone()),
-                    site_packages: SitePackages::Known(vec![site_packages.clone()]),
+                    src_roots: vec![src.clone()],
+                    custom_typeshed: Some(typeshed.clone()),
+                    python_path: PythonPath::KnownSitePackages(vec![site_packages.clone()]),
                 },
             },
         )
@@ -294,8 +294,8 @@ impl TestCaseBuilder<VendoredTypeshed> {
                 python_version,
                 python_platform,
                 search_paths: SearchPathSettings {
-                    site_packages: SitePackages::Known(vec![site_packages.clone()]),
-                    ..SearchPathSettings::new(src.clone())
+                    python_path: PythonPath::KnownSitePackages(vec![site_packages.clone()]),
+                    ..SearchPathSettings::new(vec![src.clone()])
                 },
             },
         )

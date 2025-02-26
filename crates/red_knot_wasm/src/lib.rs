@@ -3,10 +3,11 @@ use std::any::Any;
 use js_sys::Error;
 use wasm_bindgen::prelude::*;
 
-use red_knot_workspace::db::{Db, ProjectDatabase};
-use red_knot_workspace::project::settings::Configuration;
-use red_knot_workspace::project::ProjectMetadata;
-use ruff_db::diagnostic::Diagnostic;
+use red_knot_project::metadata::options::{EnvironmentOptions, Options};
+use red_knot_project::metadata::value::RangedValue;
+use red_knot_project::ProjectMetadata;
+use red_knot_project::{Db, ProjectDatabase};
+use ruff_db::diagnostic::{Diagnostic, DisplayDiagnosticConfig};
 use ruff_db::files::{system_path_to_file, File};
 use ruff_db::system::walk_directory::WalkDirectoryBuilder;
 use ruff_db::system::{
@@ -42,15 +43,17 @@ impl Workspace {
     #[wasm_bindgen(constructor)]
     pub fn new(root: &str, settings: &Settings) -> Result<Workspace, Error> {
         let system = WasmSystem::new(SystemPath::new(root));
-        let workspace = ProjectMetadata::discover(
-            SystemPath::new(root),
-            &system,
-            Some(&Configuration {
-                python_version: Some(settings.python_version.into()),
-                ..Configuration::default()
+
+        let mut workspace =
+            ProjectMetadata::discover(SystemPath::new(root), &system).map_err(into_error)?;
+
+        workspace.apply_cli_options(Options {
+            environment: Some(EnvironmentOptions {
+                python_version: Some(RangedValue::cli(settings.python_version.into())),
+                ..EnvironmentOptions::default()
             }),
-        )
-        .map_err(into_error)?;
+            ..Options::default()
+        });
 
         let db = ProjectDatabase::new(workspace, system.clone()).map_err(into_error)?;
 
@@ -111,9 +114,10 @@ impl Workspace {
     pub fn check_file(&self, file_id: &FileHandle) -> Result<Vec<String>, Error> {
         let result = self.db.check_file(file_id.file).map_err(into_error)?;
 
+        let display_config = DisplayDiagnosticConfig::default().color(false);
         Ok(result
             .into_iter()
-            .map(|diagnostic| diagnostic.display(&self.db).to_string())
+            .map(|diagnostic| diagnostic.display(&self.db, &display_config).to_string())
             .collect())
     }
 
@@ -121,9 +125,10 @@ impl Workspace {
     pub fn check(&self) -> Result<Vec<String>, Error> {
         let result = self.db.check().map_err(into_error)?;
 
+        let display_config = DisplayDiagnosticConfig::default().color(false);
         Ok(result
             .into_iter()
-            .map(|diagnostic| diagnostic.display(&self.db).to_string())
+            .map(|diagnostic| diagnostic.display(&self.db, &display_config).to_string())
             .collect())
     }
 
@@ -193,7 +198,7 @@ pub enum PythonVersion {
     Py313,
 }
 
-impl From<PythonVersion> for red_knot_python_semantic::PythonVersion {
+impl From<PythonVersion> for ruff_python_ast::PythonVersion {
     fn from(value: PythonVersion) -> Self {
         match value {
             PythonVersion::Py37 => Self::PY37,
@@ -259,6 +264,10 @@ impl System for WasmSystem {
         self.fs.current_directory()
     }
 
+    fn user_config_directory(&self) -> Option<SystemPathBuf> {
+        None
+    }
+
     fn read_directory<'a>(
         &'a self,
         path: &SystemPath,
@@ -299,8 +308,8 @@ mod tests {
     #[test]
     fn same_default_as_python_version() {
         assert_eq!(
-            red_knot_python_semantic::PythonVersion::from(PythonVersion::default()),
-            red_knot_python_semantic::PythonVersion::default()
+            ruff_python_ast::PythonVersion::from(PythonVersion::default()),
+            ruff_python_ast::PythonVersion::default()
         );
     }
 }
